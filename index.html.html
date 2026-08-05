@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>AI CAD Converter - Плоские детали</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background: #f4f4f9; display: flex; gap: 20px; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 400px; }
+        #canvas-container { width: 600px; height: 500px; background: #222; border-radius: 8px; }
+        button { background: #28a745; color: white; border: none; padding: 12px 15px; border-radius: 4px; cursor: pointer; width: 100%; font-weight: bold; margin-top: 10px; }
+        button:hover { background: #218838; }
+        .download-btn { background: #007bff; display: none; text-align: center; text-decoration: none; padding: 12px 15px; border-radius: 4px; color: white; font-weight: bold; margin-top: 10px; box-sizing: border-box; }
+        .download-btn:hover { background: #0056b3; }
+        select, input[type="file"] { width: 100%; padding: 8px; margin-top: 5px; margin-bottom: 15px; border-radius: 4px; border: 1px solid #ccc; box-sizing: border-box; }
+        pre { background: #eee; padding: 10px; border-radius: 4px; max-height: 120px; overflow-y: auto; font-size: 12px; }
+        label { font-weight: bold; font-size: 14px; color: #333; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+<div class="card">
+    <h2>Конвертер чертежей в ЧПУ</h2>
+    
+    <label for="partType">Тип детали и обработки:</label>
+    <select id="partType">
+        <option value="flat_laser">Плоская (Лазерная / Плазменная резка) $\rightarrow$ DXF</option>
+        <option value="lathe_tube">Цилиндрическая / Труба (Токарная обработка) $\rightarrow$ STEP</option>
+    </select>
+
+    <label for="dxfFile">Загрузить чертеж (DXF):</label>
+    <input type="file" id="dxfFile" accept=".dxf">
+
+    <button onclick="processDrawing()">Очистить и подготовить DXF</button>
+    
+    <h3>Статус / Результат:</h3>
+    <pre id="result">Выберите файл и нажмите кнопку...</pre>
+
+    <a id="downloadLink" class="download-btn" href="#" download>Скачать чистый DXF</a>
+</div>
+
+<div id="canvas-container"></div>
+
+<script>
+    // Если тестируете локально, оставьте http://127.0.0.1:8000. 
+    // После деплоя на Render замените на URL вашего сервиса (например, https://your-app.onrender.com)
+    const API_URL = "http://127.0.0.1:8000";
+
+    const container = document.getElementById('canvas-container');
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    container.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(10, 20, 15);
+    scene.add(dirLight);
+
+    const geometry = new THREE.BoxGeometry(2, 2, 2);
+    const material = new THREE.MeshStandardMaterial({ color: 0x28a745, roughness: 0.3 });
+    const mesh = new THREE.Mesh(geometry, material);
+    scene.add(mesh);
+
+    camera.position.z = 5;
+
+    function animate() {
+        requestAnimationFrame(animate);
+        mesh.rotation.x += 0.005;
+        mesh.rotation.y += 0.005;
+        renderer.render(scene, camera);
+    }
+    animate();
+
+    async function processDrawing() {
+        const fileInput = document.getElementById('dxfFile');
+        const partType = document.getElementById('partType').value;
+        const downloadBtn = document.getElementById('downloadLink');
+
+        downloadBtn.style.display = 'none';
+
+        if (fileInput.files.length === 0) {
+            alert("Пожалуйста, выберите DXF-файл!");
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append("file", fileInput.files[0]);
+        formData.append("part_type", partType);
+
+        document.getElementById('result').innerText = "Идет очистка чертежа и анализ контуров...";
+
+        try {
+            const response = await fetch(`${API_URL}/process-part/`, {
+                method: 'POST',
+                body: formData
+            });
+
+            const result = await response.json();
+            
+            if (!response.ok) {
+                throw new Error(result.detail || "Ошибка обработки");
+            }
+
+            document.getElementById('result').innerText = JSON.stringify(result, result.analysis, 2);
+
+            if (result.download_url) {
+                downloadBtn.href = API_URL + result.download_url;
+                downloadBtn.style.display = 'block';
+            }
+
+        } catch (error) {
+            document.getElementById('result').innerText = "Ошибка: " + error.message;
+        }
+    }
+</script>
+
+</body>
+</html>
