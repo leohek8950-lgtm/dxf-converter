@@ -4,60 +4,15 @@
     <meta charset="UTF-8">
     <title>AI CAD Converter - 3D Visualizer</title>
     <style>
-        body {
-            margin: 0;
-            font-family: Arial, sans-serif;
-            background-color: #f4f6f9;
-            display: flex;
-            height: 100vh;
-            overflow: hidden;
-        }
-        .sidebar {
-            width: 420px;
-            background: #ffffff;
-            box-shadow: 2px 0 10px rgba(0,0,0,0.1);
-            padding: 20px;
-            box-sizing: border-box;
-            display: flex;
-            flex-direction: column;
-            gap: 15px;
-            z-index: 10;
-        }
+        body { margin: 0; font-family: Arial, sans-serif; background-color: #f4f6f9; display: flex; height: 100vh; overflow: hidden; }
+        .sidebar { width: 420px; background: #ffffff; box-shadow: 2px 0 10px rgba(0,0,0,0.1); padding: 20px; box-sizing: border-box; display: flex; flex-direction: column; gap: 15px; z-index: 10; }
         h2 { margin-top: 0; color: #333; font-size: 20px; }
         label { font-size: 14px; font-weight: bold; color: #555; }
-        select, input[type="file"], button {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ccc;
-            border-radius: 6px;
-            box-sizing: border-box;
-            font-size: 14px;
-        }
-        button {
-            background-color: #28a745;
-            color: white;
-            border: none;
-            cursor: pointer;
-            font-weight: bold;
-            transition: background 0.2s;
-        }
+        select, input[type="file"], button { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
+        button { background-color: #28a745; color: white; border: none; cursor: pointer; font-weight: bold; transition: background 0.2s; }
         button:hover { background-color: #218838; }
-        .result-box {
-            background: #e9ecef;
-            padding: 12px;
-            border-radius: 6px;
-            font-family: monospace;
-            font-size: 12px;
-            white-space: pre-wrap;
-            max-height: 250px;
-            overflow-y: auto;
-            flex-grow: 1;
-        }
-        #canvas-container {
-            flex-grow: 1;
-            background: #000;
-            position: relative;
-        }
+        .result-box { background: #e9ecef; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 12px; white-space: pre-wrap; max-height: 250px; overflow-y: auto; flex-grow: 1; }
+        #canvas-container { flex-grow: 1; background: #111; position: relative; }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
@@ -66,21 +21,15 @@
 
     <div class="sidebar">
         <h2>Конвертер чертежей в ЧПУ</h2>
-        
         <div>
             <label>Тип детали и обработки:</label>
-            <select id="processType">
-                <option>Плоская (Лазерная / Плазменная резка) -&gt; DXF</option>
-            </select>
+            <select id="processType"><option>Плоская резка -> DXF</option></select>
         </div>
-
         <div>
             <label>Загрузить чертеж (DXF):</label>
             <input type="file" id="dxfFile" accept=".dxf">
         </div>
-
         <button onclick="uploadAndProcess()">Очистить и визуализировать DXF</button>
-
         <div>
             <label>Статус / Результат:</label>
             <div id="resultOutput" class="result-box">Загрузите файл для построения 3D...</div>
@@ -90,7 +39,7 @@
     <div id="canvas-container"></div>
 
     <script>
-        let scene, camera, renderer, controls;
+        let scene, camera, renderer, controls, gridHelper;
 
         function initThree() {
             const container = document.getElementById('canvas-container');
@@ -99,8 +48,8 @@
             scene = new THREE.Scene();
             scene.background = new THREE.Color(0x111111);
 
-            camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100000);
-            camera.position.set(0, 0, 200);
+            camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 1, 1000000);
+            camera.position.set(0, 0, 1000); // Глубокая позиция по умолчанию
 
             renderer = new THREE.WebGLRenderer({ antialias: true });
             renderer.setSize(container.clientWidth, container.clientHeight);
@@ -109,9 +58,10 @@
             controls = new THREE.OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
 
-            const grid = new THREE.GridHelper(500, 50, 0x444444, 0x222222);
-            grid.rotation.x = Math.PI / 2;
-            scene.add(grid);
+            // Настраиваем GridHelper, чтобы он не был черным пятном
+            gridHelper = new THREE.GridHelper(1000, 20, 0x444444, 0x222222);
+            gridHelper.rotation.x = Math.PI / 2;
+            scene.add(gridHelper);
 
             window.addEventListener('resize', onWindowResize);
             animate();
@@ -142,19 +92,13 @@
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
 
-            outputBox.textContent = 'Обработка чертежа и кривых...';
+            outputBox.textContent = 'Обработка чертежа на сервере...';
 
             try {
-                const response = await fetch('/process-dxf', {
-                    method: 'POST',
-                    body: formData
-                });
-
+                const response = await fetch('/process-dxf', { method: 'POST', body: formData });
                 const data = await response.json();
 
-                if (!response.ok) {
-                    throw new Error(data.detail || 'Ошибка сервера');
-                }
+                if (!response.ok) throw new Error(data.detail || 'Ошибка сервера');
 
                 outputBox.textContent = JSON.stringify(data, null, 2);
                 renderGeometry(data.segments);
@@ -173,7 +117,7 @@
             const group = new THREE.Group();
             group.name = 'dxfGroup';
 
-            const material = new THREE.LineBasicMaterial({ color: 0x00ff88, linewidth: 2 });
+            const lineMaterial = new THREE.LineBasicMaterial({ color: 0x00ff88, linewidth: 2 });
             const linePositions = [];
 
             let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -182,7 +126,6 @@
                 if (seg.type === 'line') {
                     linePositions.push(seg.x1, seg.y1, 0);
                     linePositions.push(seg.x2, seg.y2, 0);
-
                     minX = Math.min(minX, seg.x1, seg.x2);
                     maxX = Math.max(maxX, seg.x1, seg.x2);
                     minY = Math.min(minY, seg.y1, seg.y2);
@@ -190,10 +133,9 @@
                 } else if (seg.type === 'circle') {
                     const circleGeo = new THREE.CircleGeometry(seg.r, 64);
                     const wireframe = new THREE.WireframeGeometry(circleGeo);
-                    const circleLine = new THREE.LineSegments(wireframe, material);
+                    const circleLine = new THREE.LineSegments(wireframe, lineMaterial);
                     circleLine.position.set(seg.cx, seg.cy, 0);
                     group.add(circleLine);
-
                     minX = Math.min(minX, seg.cx - seg.r);
                     maxX = Math.max(maxX, seg.cx + seg.r);
                     minY = Math.min(minY, seg.cy - seg.r);
@@ -204,7 +146,7 @@
             if (linePositions.length > 0) {
                 const geometry = new THREE.BufferGeometry();
                 geometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
-                const lines = new THREE.LineSegments(geometry, material);
+                const lines = new THREE.LineSegments(geometry, lineMaterial);
                 group.add(lines);
             }
 
@@ -216,9 +158,22 @@
             const height = maxY - minY;
             const maxDim = Math.max(width, height);
 
+            // Настраиваем камеру и зум по габаритам
             controls.target.set(0, 0, 0);
-            camera.position.set(0, 0, maxDim > 0 ? maxDim * 1.5 : 200);
+            
+            // Расчет дистанции камеры: maxDim * 1.5, но не меньше 500 для совсем мелких деталей
+            const camDistance = Math.max(maxDim * 1.5, 500);
+            camera.position.set(0, 0, camDistance);
+            camera.far = camDistance * 10; // Настраиваем дальнюю плоскость отсечения
+            camera.updateProjectionMatrix();
             camera.lookAt(0, 0, 0);
+
+            // Масштабируем GridHelper под размер детали
+            if (gridHelper) scene.remove(gridHelper);
+            const gridSize = Math.max(maxDim * 2, 1000);
+            gridHelper = new THREE.GridHelper(gridSize, 20, 0x444444, 0x222222);
+            gridHelper.rotation.x = Math.PI / 2;
+            scene.add(gridHelper);
 
             scene.add(group);
         }
