@@ -59,7 +59,6 @@
             position: relative;
         }
     </style>
-    <!-- Подключаем Three.js через CDN -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 </head>
@@ -84,7 +83,7 @@
 
         <div>
             <label>Статус / Результат:</label>
-            <div id="resultOutput" class="result-box">Ожидание загрузки файла...</div>
+            <div id="resultOutput" class="result-box">Загрузите файл для построения 3D...</div>
         </div>
     </div>
 
@@ -95,11 +94,13 @@
 
         function initThree() {
             const container = document.getElementById('canvas-container');
+            container.innerHTML = ''; 
+
             scene = new THREE.Scene();
             scene.background = new THREE.Color(0x111111);
 
-            camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 10000);
-            camera.position.set(0, 0, 500);
+            camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100000);
+            camera.position.set(0, 0, 200);
 
             renderer = new THREE.WebGLRenderer({ antialias: true });
             renderer.setSize(container.clientWidth, container.clientHeight);
@@ -108,7 +109,7 @@
             controls = new THREE.OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
 
-            const grid = new THREE.GridHelper(1000, 50, 0x444444, 0x222222);
+            const grid = new THREE.GridHelper(500, 50, 0x444444, 0x222222);
             grid.rotation.x = Math.PI / 2;
             scene.add(grid);
 
@@ -141,7 +142,7 @@
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
 
-            outputBox.textContent = 'Обработка и анализ файла на сервере...';
+            outputBox.textContent = 'Обработка чертежа и кривых...';
 
             try {
                 const response = await fetch('/process-dxf', {
@@ -164,56 +165,60 @@
         }
 
         function renderGeometry(segments) {
-            // Удаляем старые нарисованные объекты детали
             const oldGroup = scene.getObjectByName('dxfGroup');
             if (oldGroup) scene.remove(oldGroup);
+
+            if (!segments || segments.length === 0) return;
 
             const group = new THREE.Group();
             group.name = 'dxfGroup';
 
             const material = new THREE.LineBasicMaterial({ color: 0x00ff88, linewidth: 2 });
+            const linePositions = [];
 
-            if (segments && segments.length > 0) {
-                let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
 
-                segments.forEach(seg => {
-                    if (seg.type === 'line') {
-                        const points = [
-                            new THREE.Vector3(seg.x1, seg.y1, 0),
-                            new THREE.Vector3(seg.x2, seg.y2, 0)
-                        ];
-                        const geometry = new THREE.BufferGeometry().setFromPoints(points);
-                        const line = new THREE.Line(geometry, material);
-                        group.add(line);
+            segments.forEach(seg => {
+                if (seg.type === 'line') {
+                    linePositions.push(seg.x1, seg.y1, 0);
+                    linePositions.push(seg.x2, seg.y2, 0);
 
-                        minX = Math.min(minX, seg.x1, seg.x2);
-                        maxX = Math.max(maxX, seg.x1, seg.x2);
-                        minY = Math.min(minY, seg.y1, seg.y2);
-                        maxY = Math.max(maxY, seg.y1, seg.y2);
-                    } else if (seg.type === 'circle') {
-                        const circleGeo = new THREE.CircleGeometry(seg.r, 32);
-                        const wireframe = new THREE.WireframeGeometry(circleGeo);
-                        const circleLine = new THREE.LineSegments(wireframe, material);
-                        circleLine.position.set(seg.cx, seg.cy, 0);
-                        group.add(circleLine);
+                    minX = Math.min(minX, seg.x1, seg.x2);
+                    maxX = Math.max(maxX, seg.x1, seg.x2);
+                    minY = Math.min(minY, seg.y1, seg.y2);
+                    maxY = Math.max(maxY, seg.y1, seg.y2);
+                } else if (seg.type === 'circle') {
+                    const circleGeo = new THREE.CircleGeometry(seg.r, 64);
+                    const wireframe = new THREE.WireframeGeometry(circleGeo);
+                    const circleLine = new THREE.LineSegments(wireframe, material);
+                    circleLine.position.set(seg.cx, seg.cy, 0);
+                    group.add(circleLine);
 
-                        minX = Math.min(minX, seg.cx - seg.r);
-                        maxX = Math.max(maxX, seg.cx + seg.r);
-                        minY = Math.min(minY, seg.cy - seg.r);
-                        maxY = Math.max(maxY, seg.cy + seg.r);
-                    }
-                });
+                    minX = Math.min(minX, seg.cx - seg.r);
+                    maxX = Math.max(maxX, seg.cx + seg.r);
+                    minY = Math.min(minY, seg.cy - seg.r);
+                    maxY = Math.max(maxY, seg.cy + seg.r);
+                }
+            });
 
-                // Центрируем камеру по габаритам детали
-                const centerX = (minX + maxX) / 2;
-                const centerY = (minY + maxY) / 2;
-                group.position.set(-centerX, -centerY, 0);
-                controls.target.set(0, 0, 0);
-
-                const maxDim = Math.max(maxX - minX, maxY - minY);
-                camera.position.set(0, 0, maxDim > 0 ? maxDim * 1.5 : 500);
-                camera.lookAt(0, 0, 0);
+            if (linePositions.length > 0) {
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
+                const lines = new THREE.LineSegments(geometry, material);
+                group.add(lines);
             }
+
+            const centerX = (minX + maxX) / 2;
+            const centerY = (minY + maxY) / 2;
+            group.position.set(-centerX, -centerY, 0);
+
+            const width = maxX - minX;
+            const height = maxY - minY;
+            const maxDim = Math.max(width, height);
+
+            controls.target.set(0, 0, 0);
+            camera.position.set(0, 0, maxDim > 0 ? maxDim * 1.5 : 200);
+            camera.lookAt(0, 0, 0);
 
             scene.add(group);
         }
