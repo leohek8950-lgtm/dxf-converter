@@ -5,6 +5,8 @@ import ezdxf.recover
 import ezdxf.path
 import io
 import math
+import cv2
+import numpy as np
 
 app = FastAPI(title="AI CAD Converter & 3D Visualizer")
 
@@ -26,12 +28,11 @@ def extract_primitive_entities(entities):
         else:
             yield entity
 
-def process_entity(entity, geometry_segments):
+def process_dxf_entity(entity, geometry_segments):
     e_type = entity.dxftype()
 
     if e_type == 'LINE':
         s, e = entity.dxf.start, entity.dxf.end
-        # Игнорируем осевую линию штрих-пунктир
         line_style = getattr(entity.dxf, 'linetype', '').upper()
         if 'CENTER' in line_style or 'DASHDOT' in line_style:
             return
@@ -92,27 +93,70 @@ def process_entity(entity, geometry_segments):
         except Exception:
             pass
 
-@app.post("/process-dxf")
-async def process_dxf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith('.dxf'):
-        raise HTTPException(status_code=400, detail="Поддерживаются только .dxf файлы.")
+def process_image_file(contents: bytes):
+    nparr = np.frombuffer(contents, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Не удалось прочитать изображение.")
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     
+    geometry_segments = []
+    h, w = img.shape[:2]
+
+    for cnt in contours:
+        epsilon = 0.003 * cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, epsilon, True)
+        
+        n = len(approx)
+        if n < 2:
+            continue
+
+        for i in range(n):
+            pt1 = approx[i][0]
+            pt2 = approx[(i + 1) % n][0]
+            geometry_segments.append({
+                "type": "line",
+                "x1": float(pt1[0]),
+                "y1": float(h - pt1[1]),
+                "x2": float(pt2[0]),
+                "y2": float(h - pt2[1])
+            })
+
+    return geometry_segments
+
+@app.post("/process-dxf")
+async def process_file(file: UploadFile = File(...)):
+    filename = file.filename.lower()
+    valid_exts = ('.dxf', '.png', '.jpg', '.jpeg')
+    if not filename.endswith(valid_exts):
+        raise HTTPException(status_code=400, detail="Поддерживаются файлы .dxf, .png, .jpg, .jpeg")
+
+    contents = await file.read()
+    geometry_segments = []
+
     try:
-        contents = await file.read()
-        try:
-            doc, auditor = ezdxf.recover.read(io.BytesIO(contents))
-        except Exception:
-            text_data = contents.decode('utf-8', errors='ignore')
-            doc, auditor = ezdxf.recover.read(io.StringIO(text_data))
+        if filename.endswith(('.png', '.jpg', '.jpeg')):
+            geometry_segments = process_image_file(contents)
+            entity_counts = {"IMAGE_CONTOURS": len(geometry_segments)}
+        else:
+            try:
+                doc, auditor = ezdxf.recover.read(io.BytesIO(contents))
+            except Exception:
+                text_data = contents.decode('utf-8', errors='ignore')
+                doc, auditor = ezdxf.recover.read(io.StringIO(text_data))
 
-        msp = doc.modelspace()
-        geometry_segments = []
-        entity_counts = {}
+            msp = doc.modelspace()
+            entity_counts = {}
 
-        for entity in extract_primitive_entities(msp):
-            e_type = entity.dxftype()
-            entity_counts[e_type] = entity_counts.get(e_type, 0) + 1
-            process_entity(entity, geometry_segments)
+            for entity in extract_primitive_entities(msp):
+                e_type = entity.dxftype()
+                entity_counts[e_type] = entity_counts.get(e_type, 0) + 1
+                process_dxf_entity(entity, geometry_segments)
 
         return {
             "filename": file.filename,
@@ -122,4 +166,4 @@ async def process_dxf(file: UploadFile = File(...)):
             "segments": geometry_segments
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка обработки DXF: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ошибка обработки файла: {str(e)}")
