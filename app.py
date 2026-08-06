@@ -17,31 +17,90 @@ async def serve_frontend():
     except FileNotFoundError:
         return "<h1>Ошибка: файл index.html не найден.</h1>"
 
-def filter_dimension_spikes(y_coords, window_size=17, spike_threshold=10.0):
+def extract_engineering_profile(img_bytes: bytes):
     """
-    Удаляет узкие пики (выносные размерные линии), сравнивая 
-    точки профиля с локальной медианой окрестности.
+    Инженерный анализатор чертежей:
+    - Подавление тонких выносных/размерных линий (ГОСТ 2.303-68)
+    - Поиск основного видимого контура детали
+    - Построение радиусного профиля относительно оси симметрии
     """
-    if len(y_coords) < window_size:
-        return y_coords
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Не удалось декодировать изображение.")
 
-    arr = np.array(y_coords, dtype=np.float32)
-    half = window_size // 2
-    padded = np.pad(arr, (half, half), mode='edge')
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
 
-    # Вычисление скользящей медианы
-    medians = np.array([np.median(padded[i : i + window_size]) for i in range(len(arr))])
+    # 1. Бинаризация (инвертируем: чертеж -> белый, фон -> черный)
+    _, binary = cv2.threshold(gray, 210, 255, cv2.THRESH_BINARY_INV)
 
-    # Если точка резко выскакивает вверх относительно медианы — это размерная линия
-    cleaned = np.where(arr > medians + spike_threshold, medians, arr)
+    # 2. Фильтрация по толщине линий (ГОСТ: Основная линия толще размерной)
+    # Морфологическое "открытие" стирает тонкие выносные линии и стрелки (1-2px)
+    kernel_thick = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    main_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_thick)
 
-    # Итоговый проход скользящей медианы для сглаживания граней
-    padded_cleaned = np.pad(cleaned, (half, half), mode='edge')
-    final_y = [float(np.median(padded_cleaned[i : i + window_size])) for i in range(len(cleaned))]
+    # 3. Фильтрация мелких текстовых компонентов и размеров
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(main_lines)
+    clean_mask = np.zeros_like(main_lines)
+    
+    # Оставляем только крупные связные области (саму деталь)
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        width = stats[i, cv2.CC_STAT_WIDTH]
+        height = stats[i, cv2.CC_STAT_HEIGHT]
+        
+        # Если элемент имеет физический размер детали (не мелкая цифра или стрелка)
+        if area > (w * h * 0.002) and width > (w * 0.08):
+            clean_mask[labels == i] = 255
 
-    return final_y
+    # 4. Поиск горизонтальной оси симметрии (центр масс детали)
+    M = cv2.moments(clean_mask)
+    if M["m00"] != 0:
+        center_y = int(M["m01"] / M["m00"])
+    else:
+        center_y = h // 2
+
+    # 5. Сканирование профиля детали от оси вращения (Center Y) ВВЕРХ
+    raw_x = []
+    raw_r = []
+
+    # Определяем границы детали по X
+    x_indices = np.where(clean_mask > 0)[1]
+    if len(x_indices) == 0:
+        raise ValueError("Не удалось выделить главный контур детали.")
+
+    min_x, max_x = np.min(x_indices), np.max(x_indices)
+    
+    # Сканируем только тело детали
+    step = max(1, (max_x - min_x) // 200)
+    for x in range(min_x, max_x, step):
+        col = clean_mask[0:center_y, x]
+        black_pixels = np.where(col > 0)[0]
+        
+        if len(black_pixels) > 0:
+            top_y = black_pixels[0]
+            radius = center_y - top_y
+            raw_x.append(float(x - min_x)) # Смещаем начало к 0
+            raw_r.append(float(radius))
+
+    # 6. Аппроксимация ступеней (Токарная обработка состоит из цилиндров и конусов)
+    # Медианное сглаживание для удаления остаточного пиксельного «мусора»
+    window = 11
+    smoothed_r = []
+    half = window // 2
+    padded = np.pad(raw_r, (half, half), mode='edge')
+    
+    for i in range(len(raw_r)):
+        smoothed_r.append(float(np.median(padded[i : i + window])))
+
+    # Формируем контур для Three.js
+    profile_points = [{"x": x, "y": r} for x, r in zip(raw_x, smoothed_r)]
+
+    return [profile_points], {"CONTOUR_POINTS": len(profile_points), "AXIS_Y": center_y}
 
 def process_dxf_file(contents: bytes):
+    """Анализатор векторов DXF"""
     try:
         doc, auditor = ezdxf.recover.read(io.BytesIO(contents))
     except Exception:
@@ -56,7 +115,7 @@ def process_dxf_file(contents: bytes):
         if e_type == 'LINE':
             s, e = entity.dxf.start, entity.dxf.end
             line_style = getattr(entity.dxf, 'linetype', '').upper()
-            if 'CENTER' in line_style or 'DASHDOT' in line_style:
+            if 'CENTER' in line_style or 'DASHDOT' in line_style or 'DIM' in entity.dxf.layer.upper():
                 continue
             contours.append([
                 {"x": round(s.x, 2), "y": round(s.y, 2)},
@@ -79,49 +138,6 @@ def process_dxf_file(contents: bytes):
 
     return contours, {"DXF_ENTITIES": len(contours)}
 
-def process_image_file(contents: bytes):
-    nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Не удалось прочитать изображение.")
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-
-    # 1. Бинаризация изображения
-    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-
-    # 2. Удаление мелкого одиночного шума и стрелок (морфологическая очистка)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    thresh_cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-
-    center_y = h // 2
-    raw_x = []
-    raw_y = []
-
-    # 3. Сканирование профиля детали от оси вращения Y вверх
-    step = max(1, w // 300)
-    for x in range(0, w, step):
-        col = thresh_cleaned[0:center_y, x]
-        black_pixels = np.where(col > 0)[0]
-        
-        if len(black_pixels) > 0:
-            top_y = black_pixels[0]
-            radius = center_y - top_y
-            raw_x.append(float(x))
-            raw_y.append(float(max(0, radius)))
-
-    if len(raw_y) < 5:
-        raise ValueError("Контур детали не найден.")
-
-    # 4. Фильтрация выносных размерных линий (убирает узкие вертикальные диски)
-    filtered_y = filter_dimension_spikes(raw_y, window_size=19, spike_threshold=8.0)
-
-    # 5. Формирование итогового профиля
-    profile_points = [{"x": x, "y": y} for x, y in zip(raw_x, filtered_y)]
-
-    return [profile_points], {"PROFILE_POINTS": len(profile_points)}
-
 @app.post("/process-dxf")
 async def process_file(file: UploadFile = File(...)):
     filename = file.filename.lower()
@@ -132,7 +148,7 @@ async def process_file(file: UploadFile = File(...)):
 
     try:
         if filename.endswith(('.png', '.jpg', '.jpeg')):
-            contours, breakdown = process_image_file(contents)
+            contours, breakdown = extract_engineering_profile(contents)
         else:
             contours, breakdown = process_dxf_file(contents)
 
@@ -144,4 +160,4 @@ async def process_file(file: UploadFile = File(...)):
             "contours": contours
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ошибка анализа чертежа: {str(e)}")
