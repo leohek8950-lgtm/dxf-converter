@@ -22,21 +22,21 @@
     <div class="sidebar">
         <h2>Конвертер чертежей в ЧПУ</h2>
         <div>
-            <label>Режим 3D-визуализации:</label>
+            <label>Тип 3D-моделирования:</label>
             <select id="processType">
-                <option value="extrude" selected>Плоская деталь -> 3D Выдавливание (Extrude)</option>
-                <option value="lathe">Токарная деталь -> 3D Вращение (Revolve)</option>
-                <option value="wireframe">Чертеж -> 2D Векторная сетка</option>
+                <option value="extrude" selected>Плоская деталь -> 3D Extrude</option>
+                <option value="lathe">Токарная деталь -> 3D Revolve</option>
+                <option value="wireframe">Векторный каркас</option>
             </select>
         </div>
         <div>
-            <label>Загрузить файл (DXF, PNG, JPG):</label>
+            <label>Загрузить чертеж (DXF, PNG, JPG):</label>
             <input type="file" id="dxfFile" accept=".dxf,.png,.jpg,.jpeg">
         </div>
         <button onclick="uploadAndProcess()">Сгенерировать 3D</button>
         <div>
-            <label>Статус / Данные геометрии:</label>
-            <div id="resultOutput" class="result-box">Загрузите файл...</div>
+            <label>Статус обработки:</label>
+            <div id="resultOutput" class="result-box">Загрузите чертеж...</div>
         </div>
     </div>
 
@@ -44,7 +44,7 @@
 
     <script>
         let scene, camera, renderer, controls, gridHelper;
-        let currentSegments = [];
+        let currentContours = [];
 
         function initThree() {
             const container = document.getElementById('canvas-container');
@@ -54,7 +54,7 @@
             scene.background = new THREE.Color(0x1a1a1a);
 
             camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 1, 100000);
-            camera.position.set(0, 100, 250);
+            camera.position.set(0, 150, 300);
 
             renderer = new THREE.WebGLRenderer({ antialias: true });
             renderer.setSize(container.clientWidth, container.clientHeight);
@@ -67,10 +67,6 @@
             dirLight1.position.set(200, 300, 200);
             scene.add(dirLight1);
 
-            const dirLight2 = new THREE.DirectionalLight(0x99ccff, 0.4);
-            dirLight2.position.set(-200, -100, -200);
-            scene.add(dirLight2);
-
             controls = new THREE.OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
 
@@ -78,7 +74,7 @@
             scene.add(gridHelper);
 
             window.addEventListener('resize', onWindowResize);
-            document.getElementById('processType').addEventListener('change', () => renderGeometry(currentSegments));
+            document.getElementById('processType').addEventListener('change', () => renderGeometry(currentContours));
             animate();
         }
 
@@ -106,7 +102,7 @@
 
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
-            outputBox.textContent = 'Обработка файла и генерация 3D...';
+            outputBox.textContent = 'Анализ контуров и построение 3D...';
 
             try {
                 const response = await fetch('/process-dxf', { method: 'POST', body: formData });
@@ -115,80 +111,78 @@
                 if (!response.ok) throw new Error(data.detail || 'Ошибка сервера');
 
                 outputBox.textContent = JSON.stringify(data, null, 2);
-                currentSegments = data.segments;
-                renderGeometry(currentSegments);
+                currentContours = data.contours;
+                renderGeometry(currentContours);
 
             } catch (err) {
                 outputBox.textContent = 'Ошибка: ' + err.message;
             }
         }
 
-        function renderGeometry(segments) {
+        function renderGeometry(contours) {
             const oldGroup = scene.getObjectByName('dxfGroup');
             if (oldGroup) scene.remove(oldGroup);
 
-            if (!segments || segments.length === 0) return;
+            if (!contours || contours.length === 0) return;
 
             const mode = document.getElementById('processType').value;
             const group = new THREE.Group();
             group.name = 'dxfGroup';
 
-            const metalMaterial = new THREE.MeshStandardMaterial({
-                color: 0x8899a6,
+            const metalMat = new THREE.MeshStandardMaterial({
+                color: 0x90a4ae,
                 metalness: 0.8,
-                roughness: 0.25,
+                roughness: 0.2,
                 side: THREE.DoubleSide
             });
 
             if (mode === 'extrude') {
-                // Преобразуем отрезки контура в 3D объем (Extrude)
-                const shape = new THREE.Shape();
-                if (segments.length > 0) {
-                    shape.moveTo(segments[0].x1, segments[0].y1);
-                    segments.forEach(s => shape.lineTo(s.x2, s.y2));
-                }
+                contours.forEach(pts => {
+                    if (pts.length < 3) return;
+                    const shape = new THREE.Shape();
+                    shape.moveTo(pts[0].x, pts[0].y);
+                    for (let i = 1; i < pts.length; i++) {
+                        shape.lineTo(pts[i].x, pts[i].y);
+                    }
+                    shape.closePath();
 
-                const extrudeSettings = {
-                    depth: 5, // Толщина детали 5мм
-                    bevelEnabled: true,
-                    bevelSegments: 2,
-                    steps: 1,
-                    bevelSize: 0.5,
-                    bevelThickness: 0.5
-                };
-
-                const geometry = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-                const mesh = new THREE.Mesh(geometry, metalMaterial);
-                mesh.rotation.x = -Math.PI / 2;
-                group.add(mesh);
+                    const extrudeSettings = { depth: 10, bevelEnabled: true, bevelThickness: 1, bevelSize: 1 };
+                    const geo = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+                    const mesh = new THREE.Mesh(geo, metalMat);
+                    mesh.rotation.x = -Math.PI / 2;
+                    group.add(mesh);
+                });
 
             } else if (mode === 'lathe') {
-                // Режим вращения профиля
-                let profilePoints = [];
-                segments.forEach(s => {
-                    if (s.y1 >= 0 && s.y2 >= 0) {
-                        profilePoints.push(new THREE.Vector2(s.y1, s.x1));
-                        profilePoints.push(new THREE.Vector2(s.y2, s.x2));
-                    }
+                // Выбираем самый длинный контур для токарного вращения
+                let bestContour = contours[0];
+                contours.forEach(c => { if (c.length > bestContour.length) bestContour = c; });
+
+                const profilePoints = [];
+                bestContour.forEach(p => {
+                    if (p.y >= 0) profilePoints.push(new THREE.Vector2(p.y, p.x));
                 });
 
                 if (profilePoints.length > 1) {
                     const latheGeo = new THREE.LatheGeometry(profilePoints, 64);
-                    const latheMesh = new THREE.Mesh(latheGeo, metalMaterial);
+                    const latheMesh = new THREE.Mesh(latheGeo, metalMat);
                     latheMesh.rotation.z = -Math.PI / 2;
                     group.add(latheMesh);
                 }
             } else {
-                // Каркасная 2D сетка
-                const lineMaterial = new THREE.LineBasicMaterial({ color: 0x00ff88 });
-                const linePositions = [];
-                segments.forEach(s => linePositions.push(s.x1, s.y1, 0, s.x2, s.y2, 0));
-
-                const geometry = new THREE.BufferGeometry();
-                geometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
-                const lines = new THREE.LineSegments(geometry, lineMaterial);
-                lines.rotation.x = -Math.PI / 2;
-                group.add(lines);
+                const lineMat = new THREE.LineBasicMaterial({ color: 0x00ff88 });
+                contours.forEach(pts => {
+                    const pos = [];
+                    for (let i = 0; i < pts.length; i++) {
+                        const next = pts[(i + 1) % pts.length];
+                        pos.push(pts[i].x, pts[i].y, 0, next.x, next.y, 0);
+                    }
+                    const geo = new THREE.BufferGeometry();
+                    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+                    const lines = new THREE.LineSegments(geo, lineMat);
+                    lines.rotation.x = -Math.PI / 2;
+                    group.add(lines);
+                });
             }
 
             const box = new THREE.Box3().setFromObject(group);
