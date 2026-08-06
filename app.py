@@ -4,7 +4,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import ezdxf
 from ezdxf.recover import readfile
-from ezdxf.path import make_paths
+ezdxf.path
 
 app = FastAPI(title="AI CAD Converter API")
 
