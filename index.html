@@ -25,17 +25,17 @@
             <label>Тип детали и обработки:</label>
             <select id="processType">
                 <option value="flat">Плоская резка -> 2D Контур</option>
-                <option value="lathe" selected>Токарная обработка -> 3D Revolve</option>
+                <option value="lathe">Токарная обработка -> 3D Revolve</option>
             </select>
         </div>
         <div>
-            <label>Загрузить чертеж (DXF):</label>
-            <input type="file" id="dxfFile" accept=".dxf">
+            <label>Загрузить чертеж или картинку (DXF, PNG, JPG):</label>
+            <input type="file" id="dxfFile" accept=".dxf,.png,.jpg,.jpeg">
         </div>
-        <button onclick="uploadAndProcess()">Визуализировать DXF</button>
+        <button onclick="uploadAndProcess()">Визуализировать</button>
         <div>
             <label>Статус / Результат:</label>
-            <div id="resultOutput" class="result-box">Загрузите файл для построения 3D...</div>
+            <div id="resultOutput" class="result-box">Загрузите файл для визуализации...</div>
         </div>
     </div>
 
@@ -57,20 +57,14 @@
 
             renderer = new THREE.WebGLRenderer({ antialias: true });
             renderer.setSize(container.clientWidth, container.clientHeight);
-            renderer.shadowMap.enabled = true;
             container.appendChild(renderer.domElement);
 
-            // Освещение для токарных деталей
-            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
             scene.add(ambientLight);
 
-            const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
-            dirLight1.position.set(100, 200, 100);
-            scene.add(dirLight1);
-
-            const dirLight2 = new THREE.DirectionalLight(0x99ccff, 0.5);
-            dirLight2.position.set(-100, -100, -100);
-            scene.add(dirLight2);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(100, 200, 100);
+            scene.add(dirLight);
 
             controls = new THREE.OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
@@ -101,14 +95,14 @@
             const outputBox = document.getElementById('resultOutput');
 
             if (fileInput.files.length === 0) {
-                alert('Выберите DXF файл!');
+                alert('Выберите файл (DXF, PNG или JPG)!');
                 return;
             }
 
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
 
-            outputBox.textContent = 'Обработка чертежа...';
+            outputBox.textContent = 'Обработка файла...';
 
             try {
                 const response = await fetch('/process-dxf', { method: 'POST', body: formData });
@@ -136,7 +130,6 @@
             group.name = 'dxfGroup';
 
             if (mode === 'lathe') {
-                // Извлекаем профиль над осью симметрии (Y >= -0.01)
                 let profilePoints = [];
                 segments.forEach(s => {
                     if (s.y1 >= -0.01 && s.y2 >= -0.01) {
@@ -145,10 +138,8 @@
                     }
                 });
 
-                // Сортируем точки вдоль оси вращения (X)
                 profilePoints.sort((a, b) => a.x - b.x);
 
-                // Удаляем дубликаты
                 const cleanPoints = [];
                 profilePoints.forEach(p => {
                     if (cleanPoints.length === 0 || Math.hypot(p.x - cleanPoints[cleanPoints.length - 1].x, p.y - cleanPoints[cleanPoints.length - 1].y) > 0.01) {
@@ -158,18 +149,12 @@
 
                 if (cleanPoints.length > 1) {
                     const latheGeo = new THREE.LatheGeometry(cleanPoints, 64);
-                    const latheMat = new THREE.MeshStandardMaterial({
-                        color: 0xc0c0c0,
-                        metalness: 0.85,
-                        roughness: 0.2,
-                        side: THREE.DoubleSide
-                    });
+                    const latheMat = new THREE.MeshStandardMaterial({ color: 0xc0c0c0, metalness: 0.85, roughness: 0.2, side: THREE.DoubleSide });
                     const latheMesh = new THREE.Mesh(latheGeo, latheMat);
-                    latheMesh.rotation.z = -Math.PI / 2; // Ориентация по оси
+                    latheMesh.rotation.z = -Math.PI / 2;
                     group.add(latheMesh);
                 }
             } else {
-                // Обычное 2D плоское отображение
                 const lineMaterial = new THREE.LineBasicMaterial({ color: 0x00ff88, linewidth: 2 });
                 const linePositions = [];
 
@@ -181,11 +166,9 @@
                 const geometry = new THREE.BufferGeometry();
                 geometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
                 const lines = new THREE.LineSegments(geometry, lineMaterial);
-                lines.rotation.x = -Math.PI / 2;
                 group.add(lines);
             }
 
-            // Центрирование камеры
             const box = new THREE.Box3().setFromObject(group);
             const center = box.getCenter(new THREE.Vector3());
             const size = box.getSize(new THREE.Vector3());
