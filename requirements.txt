@@ -1,4 +1,6 @@
 fastapi
 uvicorn
-ezdxf
 python-multipart
+ezdxf
+opencv-python-headless
+numpy
