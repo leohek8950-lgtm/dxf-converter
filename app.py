@@ -20,11 +20,22 @@ async def process_dxf(file: UploadFile = File(...)):
     
     try:
         contents = await file.read()
-        # Читаем DXF-файл из байтов
-        doc = ezdxf.read(io.StringIO(contents.decode('utf-8', errors='ignore')))
+        
+        # Подбираем правильную кодировку для русских чертежей
+        text_data = None
+        for enc in ['utf-8', 'cp1251', 'latin-1']:
+            try:
+                text_data = contents.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+                
+        if text_data is None:
+            text_data = contents.decode('utf-8', errors='ignore')
+
+        doc = ezdxf.read(io.StringIO(text_data))
         msp = doc.modelspace()
         
-        # Собираем статистику по элементам чертежа
         entity_counts = {}
         total_entities = 0
         
@@ -38,7 +49,7 @@ async def process_dxf(file: UploadFile = File(...)):
             "status": "success",
             "entities_processed": total_entities,
             "entity_breakdown": entity_counts,
-            "message": "Чертеж успешно проанализирован и очищен!"
+            "message": "Чертеж успешно проанализирован!"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки DXF: {str(e)}")
