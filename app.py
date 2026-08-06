@@ -28,7 +28,7 @@ def extract_primitive_entities(entities):
         else:
             yield entity
 
-def process_dxf_entity(entity, geometry_segments):
+def process_dxf_entity(entity, contours_list):
     e_type = entity.dxftype()
 
     if e_type == 'LINE':
@@ -36,62 +36,28 @@ def process_dxf_entity(entity, geometry_segments):
         line_style = getattr(entity.dxf, 'linetype', '').upper()
         if 'CENTER' in line_style or 'DASHDOT' in line_style:
             return
-        geometry_segments.append({
-            "type": "line",
-            "x1": round(s.x, 4), "y1": round(s.y, 4),
-            "x2": round(e.x, 4), "y2": round(e.y, 4)
-        })
+        contours_list.append([
+            {"x": round(s.x, 2), "y": round(s.y, 2)},
+            {"x": round(e.x, 2), "y": round(e.y, 2)}
+        ])
 
-    elif e_type == 'CIRCLE':
+    elif e_type in ('CIRCLE', 'ARC'):
         cx, cy = entity.dxf.center.x, entity.dxf.center.y
         r = entity.dxf.radius
-        steps = 64
-        for i in range(steps):
-            a1 = 2 * math.pi * i / steps
-            a2 = 2 * math.pi * (i + 1) / steps
-            geometry_segments.append({
-                "type": "line",
-                "x1": round(cx + r * math.cos(a1), 4),
-                "y1": round(cy + r * math.sin(a1), 4),
-                "x2": round(cx + r * math.cos(a2), 4),
-                "y2": round(cy + r * math.sin(a2), 4)
-            })
+        if e_type == 'CIRCLE':
+            start_angle, end_angle = 0.0, 2 * math.pi
+        else:
+            start_angle = math.radians(entity.dxf.start_angle)
+            end_angle = math.radians(entity.dxf.end_angle)
+            if end_angle <= start_angle:
+                end_angle += 2 * math.pi
 
-    elif e_type == 'ARC':
-        cx, cy = entity.dxf.center.x, entity.dxf.center.y
-        r = entity.dxf.radius
-        start_angle = math.radians(entity.dxf.start_angle)
-        end_angle = math.radians(entity.dxf.end_angle)
-        
-        if end_angle <= start_angle:
-            end_angle += 2 * math.pi
-            
-        steps = max(12, int(math.degrees(end_angle - start_angle) / 5))
-        angle_step = (end_angle - start_angle) / steps
-        
-        for i in range(steps):
-            a1 = start_angle + i * angle_step
-            a2 = start_angle + (i + 1) * angle_step
-            geometry_segments.append({
-                "type": "line",
-                "x1": round(cx + r * math.cos(a1), 4),
-                "y1": round(cy + r * math.sin(a1), 4),
-                "x2": round(cx + r * math.cos(a2), 4),
-                "y2": round(cy + r * math.sin(a2), 4)
-            })
-
-    else:
-        try:
-            path = ezdxf.path.make_path(entity)
-            vertices = list(ezdxf.path.path_to_vertices(path, distance=0.1))
-            for i in range(len(vertices) - 1):
-                geometry_segments.append({
-                    "type": "line",
-                    "x1": round(vertices[i].x, 4), "y1": round(vertices[i].y, 4),
-                    "x2": round(vertices[i+1].x, 4), "y2": round(vertices[i+1].y, 4)
-                })
-        except Exception:
-            pass
+        steps = max(16, int(math.degrees(end_angle - start_angle) / 5))
+        pts = []
+        for i in range(steps + 1):
+            a = start_angle + i * ((end_angle - start_angle) / steps)
+            pts.append({"x": round(cx + r * math.cos(a), 2), "y": round(cy + r * math.sin(a), 2)})
+        contours_list.append(pts)
 
 def process_image_file(contents: bytes):
     nparr = np.frombuffer(contents, np.uint8)
@@ -101,69 +67,64 @@ def process_image_file(contents: bytes):
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     
-    geometry_segments = []
     h, w = img.shape[:2]
+    min_area = (w * h) * 0.001  # Фильтр: игнорируем элементы меньше 0.1% от площади чертежа (текст, стрелки)
+    
+    formatted_contours = []
 
     for cnt in contours:
-        epsilon = 0.003 * cv2.arcLength(cnt, True)
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue  # Пропускаем размерные цифры и мелкие стрелки
+
+        epsilon = 0.005 * cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, epsilon, True)
         
-        n = len(approx)
-        if n < 2:
+        if len(approx) < 3:
             continue
 
-        for i in range(n):
-            pt1 = approx[i][0]
-            pt2 = approx[(i + 1) % n][0]
-            geometry_segments.append({
-                "type": "line",
-                "x1": float(pt1[0]),
-                "y1": float(h - pt1[1]),
-                "x2": float(pt2[0]),
-                "y2": float(h - pt2[1])
+        poly_pts = []
+        for pt in approx:
+            poly_pts.append({
+                "x": float(pt[0][0]),
+                "y": float(h - pt[0][1])  # Инвертируем Y для координатной сетки
             })
+        formatted_contours.append(poly_pts)
 
-    return geometry_segments
+    return formatted_contours
 
 @app.post("/process-dxf")
 async def process_file(file: UploadFile = File(...)):
     filename = file.filename.lower()
-    valid_exts = ('.dxf', '.png', '.jpg', '.jpeg')
-    if not filename.endswith(valid_exts):
+    if not filename.endswith(('.dxf', '.png', '.jpg', '.jpeg')):
         raise HTTPException(status_code=400, detail="Поддерживаются файлы .dxf, .png, .jpg, .jpeg")
 
     contents = await file.read()
-    geometry_segments = []
+    contours_list = []
 
     try:
         if filename.endswith(('.png', '.jpg', '.jpeg')):
-            geometry_segments = process_image_file(contents)
-            entity_counts = {"IMAGE_CONTOURS": len(geometry_segments)}
+            contours_list = process_image_file(contents)
+            entity_counts = {"CLEAN_CONTOURS": len(contours_list)}
         else:
-            try:
-                doc, auditor = ezdxf.recover.read(io.BytesIO(contents))
-            except Exception:
-                text_data = contents.decode('utf-8', errors='ignore')
-                doc, auditor = ezdxf.recover.read(io.StringIO(text_data))
-
+            doc, auditor = ezdxf.recover.read(io.BytesIO(contents))
             msp = doc.modelspace()
             entity_counts = {}
-
             for entity in extract_primitive_entities(msp):
                 e_type = entity.dxftype()
                 entity_counts[e_type] = entity_counts.get(e_type, 0) + 1
-                process_dxf_entity(entity, geometry_segments)
+                process_dxf_entity(entity, contours_list)
 
         return {
             "filename": file.filename,
             "status": "success",
-            "entities_processed": len(geometry_segments),
+            "contours_count": len(contours_list),
             "entity_breakdown": entity_counts,
-            "segments": geometry_segments
+            "contours": contours_list
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка обработки файла: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
