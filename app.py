@@ -2,6 +2,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse
 import ezdxf
 import ezdxf.recover
+from ezdxf.path import path_to_vertices
 import io
 
 app = FastAPI(title="AI CAD Converter & 3D Visualizer")
@@ -22,11 +23,9 @@ async def process_dxf(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         
-        # Универсальный метод чтения (текст, бинарник, любые кодировки)
         try:
             doc, auditor = ezdxf.recover.read(io.BytesIO(contents))
         except Exception:
-            # Запасной вариант через строковый буфер
             text_data = None
             for enc in ['utf-8', 'cp1251', 'latin-1']:
                 try:
@@ -42,12 +41,12 @@ async def process_dxf(file: UploadFile = File(...)):
         geometry_segments = []
         entity_counts = {}
 
-        # Извлекаем геометрию для отрисовки (отрезки, дуги, полилинии)
         for entity in msp:
             e_type = entity.dxftype()
             entity_counts[e_type] = entity_counts.get(e_type, 0) + 1
 
             try:
+                # 1. Простые линии
                 if e_type == 'LINE':
                     start = entity.dxf.start
                     end = entity.dxf.end
@@ -56,7 +55,8 @@ async def process_dxf(file: UploadFile = File(...)):
                         "x1": start.x, "y1": start.y,
                         "x2": end.x, "y2": end.y
                     })
-                elif e_type == 'LWPOLYLINE':
+                # 2. Полилинии
+                elif e_type in ['LWPOLYLINE', 'POLYLINE']:
                     points = list(entity.get_points(format='xy'))
                     for i in range(len(points) - 1):
                         geometry_segments.append({
@@ -64,12 +64,13 @@ async def process_dxf(file: UploadFile = File(...)):
                             "x1": points[i][0], "y1": points[i][1],
                             "x2": points[i+1][0], "y2": points[i+1][1]
                         })
-                    if entity.closed and len(points) > 2:
+                    if getattr(entity, 'closed', False) and len(points) > 2:
                         geometry_segments.append({
                             "type": "line",
                             "x1": points[-1][0], "y1": points[-1][1],
                             "x2": points[0][0], "y2": points[0][1]
                         })
+                # 3. Окружности
                 elif e_type == 'CIRCLE':
                     center = entity.dxf.center
                     radius = entity.dxf.radius
@@ -78,6 +79,16 @@ async def process_dxf(file: UploadFile = File(...)):
                         "cx": center.x, "cy": center.y,
                         "r": radius
                     })
+                # 4. Сплайны, эллипсы, дуги и прочие кривые (раскладываем на отрезки)
+                elif e_type in ['SPLINE', 'ELLIPSE', 'ARC']:
+                    path = ezdxf.path.make_path(entity)
+                    vertices = list(path_to_vertices(path, distance=0.1))
+                    for i in range(len(vertices) - 1):
+                        geometry_segments.append({
+                            "type": "line",
+                            "x1": vertices[i].x, "y1": vertices[i].y,
+                            "x2": vertices[i+1].x, "y2": vertices[i+1].y
+                        })
             except Exception:
                 continue
 
