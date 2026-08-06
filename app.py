@@ -17,7 +17,6 @@ async def serve_frontend():
         return "<h1>Error: index.html not found.</h1>"
 
 def extract_primitive_entities(entities):
-    """Рекурсивный разбор блоков INSERT в базовые сущности"""
     for entity in entities:
         if entity.dxftype() == 'INSERT':
             try:
@@ -30,17 +29,18 @@ def extract_primitive_entities(entities):
 def process_entity(entity, geometry_segments):
     e_type = entity.dxftype()
 
-    # 1. Прямые линии (LINE)
     if e_type == 'LINE':
-        start = entity.dxf.start
-        end = entity.dxf.end
+        s, e = entity.dxf.start, entity.dxf.end
+        # Игнорируем осевую линию штрих-пунктир
+        line_style = getattr(entity.dxf, 'linetype', '').upper()
+        if 'CENTER' in line_style or 'DASHDOT' in line_style:
+            return
         geometry_segments.append({
             "type": "line",
-            "x1": round(start.x, 4), "y1": round(start.y, 4),
-            "x2": round(end.x, 4), "y2": round(end.y, 4)
+            "x1": round(s.x, 4), "y1": round(s.y, 4),
+            "x2": round(e.x, 4), "y2": round(e.y, 4)
         })
 
-    # 2. Окружности (CIRCLE) — явное построение 64 сегментами
     elif e_type == 'CIRCLE':
         cx, cy = entity.dxf.center.x, entity.dxf.center.y
         r = entity.dxf.radius
@@ -56,7 +56,6 @@ def process_entity(entity, geometry_segments):
                 "y2": round(cy + r * math.sin(a2), 4)
             })
 
-    # 3. Дуги (ARC) — расчет по начальному и конечному углам
     elif e_type == 'ARC':
         cx, cy = entity.dxf.center.x, entity.dxf.center.y
         r = entity.dxf.radius
@@ -80,7 +79,6 @@ def process_entity(entity, geometry_segments):
                 "y2": round(cy + r * math.sin(a2), 4)
             })
 
-    # 4. Полилинии, сплайны и эллипсы (LWPOLYLINE, POLYLINE, SPLINE, ELLIPSE)
     else:
         try:
             path = ezdxf.path.make_path(entity)
@@ -92,23 +90,7 @@ def process_entity(entity, geometry_segments):
                     "x2": round(vertices[i+1].x, 4), "y2": round(vertices[i+1].y, 4)
                 })
         except Exception:
-            if e_type in ['LWPOLYLINE', 'POLYLINE']:
-                try:
-                    pts = list(entity.get_points(format='xy'))
-                    for i in range(len(pts) - 1):
-                        geometry_segments.append({
-                            "type": "line",
-                            "x1": round(pts[i][0], 4), "y1": round(pts[i][1], 4),
-                            "x2": round(pts[i+1][0], 4), "y2": round(pts[i+1][1], 4)
-                        })
-                    if getattr(entity, 'closed', False) and len(pts) > 2:
-                        geometry_segments.append({
-                            "type": "line",
-                            "x1": round(pts[-1][0], 4), "y1": round(pts[-1][1], 4),
-                            "x2": round(pts[0][0], 4), "y2": round(pts[0][1], 4)
-                        })
-                except Exception:
-                    pass
+            pass
 
 @app.post("/process-dxf")
 async def process_dxf(file: UploadFile = File(...)):
@@ -117,19 +99,10 @@ async def process_dxf(file: UploadFile = File(...)):
     
     try:
         contents = await file.read()
-        
         try:
             doc, auditor = ezdxf.recover.read(io.BytesIO(contents))
         except Exception:
-            text_data = None
-            for enc in ['utf-8', 'cp1251', 'latin-1']:
-                try:
-                    text_data = contents.decode(enc)
-                    break
-                except UnicodeDecodeError:
-                    continue
-            if text_data is None:
-                text_data = contents.decode('utf-8', errors='ignore')
+            text_data = contents.decode('utf-8', errors='ignore')
             doc, auditor = ezdxf.recover.read(io.StringIO(text_data))
 
         msp = doc.modelspace()
@@ -146,8 +119,7 @@ async def process_dxf(file: UploadFile = File(...)):
             "status": "success",
             "entities_processed": len(geometry_segments),
             "entity_breakdown": entity_counts,
-            "segments": geometry_segments,
-            "message": "Чертеж успешно проанализирован!"
+            "segments": geometry_segments
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки DXF: {str(e)}")
