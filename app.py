@@ -4,6 +4,7 @@ import ezdxf
 import ezdxf.recover
 import ezdxf.path
 import io
+import math
 
 app = FastAPI(title="AI CAD Converter & 3D Visualizer")
 
@@ -16,7 +17,7 @@ async def serve_frontend():
         return "<h1>Error: index.html not found.</h1>"
 
 def extract_primitive_entities(entities):
-    """Рекурсивно разворачивает блоки (INSERT) с сохранением их координат и масштаба"""
+    """Рекурсивный разбор блоков INSERT в базовые сущности"""
     for entity in entities:
         if entity.dxftype() == 'INSERT':
             try:
@@ -25,6 +26,89 @@ def extract_primitive_entities(entities):
                 pass
         else:
             yield entity
+
+def process_entity(entity, geometry_segments):
+    e_type = entity.dxftype()
+
+    # 1. Прямые линии (LINE)
+    if e_type == 'LINE':
+        start = entity.dxf.start
+        end = entity.dxf.end
+        geometry_segments.append({
+            "type": "line",
+            "x1": round(start.x, 4), "y1": round(start.y, 4),
+            "x2": round(end.x, 4), "y2": round(end.y, 4)
+        })
+
+    # 2. Окружности (CIRCLE) — явное построение 64 сегментами
+    elif e_type == 'CIRCLE':
+        cx, cy = entity.dxf.center.x, entity.dxf.center.y
+        r = entity.dxf.radius
+        steps = 64
+        for i in range(steps):
+            a1 = 2 * math.pi * i / steps
+            a2 = 2 * math.pi * (i + 1) / steps
+            geometry_segments.append({
+                "type": "line",
+                "x1": round(cx + r * math.cos(a1), 4),
+                "y1": round(cy + r * math.sin(a1), 4),
+                "x2": round(cx + r * math.cos(a2), 4),
+                "y2": round(cy + r * math.sin(a2), 4)
+            })
+
+    # 3. Дуги (ARC) — расчет по начальному и конечному углам
+    elif e_type == 'ARC':
+        cx, cy = entity.dxf.center.x, entity.dxf.center.y
+        r = entity.dxf.radius
+        start_angle = math.radians(entity.dxf.start_angle)
+        end_angle = math.radians(entity.dxf.end_angle)
+        
+        if end_angle <= start_angle:
+            end_angle += 2 * math.pi
+            
+        steps = max(12, int(math.degrees(end_angle - start_angle) / 5))
+        angle_step = (end_angle - start_angle) / steps
+        
+        for i in range(steps):
+            a1 = start_angle + i * angle_step
+            a2 = start_angle + (i + 1) * angle_step
+            geometry_segments.append({
+                "type": "line",
+                "x1": round(cx + r * math.cos(a1), 4),
+                "y1": round(cy + r * math.sin(a1), 4),
+                "x2": round(cx + r * math.cos(a2), 4),
+                "y2": round(cy + r * math.sin(a2), 4)
+            })
+
+    # 4. Полилинии, сплайны и эллипсы (LWPOLYLINE, POLYLINE, SPLINE, ELLIPSE)
+    else:
+        try:
+            path = ezdxf.path.make_path(entity)
+            vertices = list(ezdxf.path.path_to_vertices(path, distance=0.1))
+            for i in range(len(vertices) - 1):
+                geometry_segments.append({
+                    "type": "line",
+                    "x1": round(vertices[i].x, 4), "y1": round(vertices[i].y, 4),
+                    "x2": round(vertices[i+1].x, 4), "y2": round(vertices[i+1].y, 4)
+                })
+        except Exception:
+            if e_type in ['LWPOLYLINE', 'POLYLINE']:
+                try:
+                    pts = list(entity.get_points(format='xy'))
+                    for i in range(len(pts) - 1):
+                        geometry_segments.append({
+                            "type": "line",
+                            "x1": round(pts[i][0], 4), "y1": round(pts[i][1], 4),
+                            "x2": round(pts[i+1][0], 4), "y2": round(pts[i+1][1], 4)
+                        })
+                    if getattr(entity, 'closed', False) and len(pts) > 2:
+                        geometry_segments.append({
+                            "type": "line",
+                            "x1": round(pts[-1][0], 4), "y1": round(pts[-1][1], 4),
+                            "x2": round(pts[0][0], 4), "y2": round(pts[0][1], 4)
+                        })
+                except Exception:
+                    pass
 
 @app.post("/process-dxf")
 async def process_dxf(file: UploadFile = File(...)):
@@ -52,33 +136,10 @@ async def process_dxf(file: UploadFile = File(...)):
         geometry_segments = []
         entity_counts = {}
 
-        # Рекурсивная обработка всех элементов и блоков
         for entity in extract_primitive_entities(msp):
             e_type = entity.dxftype()
             entity_counts[e_type] = entity_counts.get(e_type, 0) + 1
-
-            try:
-                # ezdxf.path автоматически рассчитывает bulge полилиний, дуги, окружности и сплайны
-                path = ezdxf.path.make_path(entity)
-                vertices = list(ezdxf.path.path_to_vertices(path, distance=0.05))
-                
-                for i in range(len(vertices) - 1):
-                    geometry_segments.append({
-                        "type": "line",
-                        "x1": round(vertices[i].x, 4),
-                        "y1": round(vertices[i].y, 4),
-                        "x2": round(vertices[i+1].x, 4),
-                        "y2": round(vertices[i+1].y, 4)
-                    })
-            except Exception:
-                # Запасной вариант для простых линий LINE
-                if e_type == 'LINE':
-                    s, e = entity.dxf.start, entity.dxf.end
-                    geometry_segments.append({
-                        "type": "line",
-                        "x1": round(s.x, 4), "y1": round(s.y, 4),
-                        "x2": round(e.x, 4), "y2": round(e.y, 4)
-                    })
+            process_entity(entity, geometry_segments)
 
         return {
             "filename": file.filename,
@@ -86,7 +147,7 @@ async def process_dxf(file: UploadFile = File(...)):
             "entities_processed": len(geometry_segments),
             "entity_breakdown": entity_counts,
             "segments": geometry_segments,
-            "message": "Чертеж проанализирован с точным построением радиусов и скруглений!"
+            "message": "Чертеж успешно проанализирован!"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки DXF: {str(e)}")
