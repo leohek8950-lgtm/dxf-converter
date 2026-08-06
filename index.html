@@ -2,18 +2,23 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI CAD Converter - 3D Visualizer</title>
     <style>
-        body { margin: 0; font-family: Arial, sans-serif; background-color: #f4f6f9; display: flex; height: 100vh; overflow: hidden; }
-        .sidebar { width: 420px; background: #ffffff; box-shadow: 2px 0 10px rgba(0,0,0,0.1); padding: 20px; box-sizing: border-box; display: flex; flex-direction: column; gap: 15px; z-index: 10; }
-        h2 { margin-top: 0; color: #333; font-size: 20px; }
-        label { font-size: 14px; font-weight: bold; color: #555; }
-        select, input[type="file"], button { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
-        button { background-color: #28a745; color: white; border: none; cursor: pointer; font-weight: bold; transition: background 0.2s; }
-        button:hover { background-color: #218838; }
-        .result-box { background: #e9ecef; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 12px; white-space: pre-wrap; max-height: 250px; overflow-y: auto; flex-grow: 1; }
-        #canvas-container { flex-grow: 1; background: #111; position: relative; }
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: 'Segoe UI', Arial, sans-serif; background-color: #f4f6f9; display: flex; height: 100vh; overflow: hidden; }
+        .sidebar { width: 380px; min-width: 320px; background: #ffffff; box-shadow: 2px 0 10px rgba(0,0,0,0.1); padding: 20px; display: flex; flex-direction: column; gap: 15px; z-index: 10; }
+        h2 { margin-top: 0; color: #1e293b; font-size: 20px; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }
+        label { font-size: 13px; font-weight: bold; color: #475569; display: block; margin-bottom: 5px; }
+        select, input[type="file"], button { width: 100%; padding: 10px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 14px; outline: none; }
+        select:focus, input[type="file"]:focus { border-color: #3b82f6; }
+        button { background-color: #10b981; color: white; border: none; cursor: pointer; font-weight: bold; transition: background 0.2s; }
+        button:hover { background-color: #059669; }
+        .result-box { background: #0f172a; color: #38bdf8; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 11px; white-space: pre-wrap; max-height: 250px; overflow-y: auto; flex-grow: 1; border: 1px solid #1e293b; }
+        #canvas-container { flex-grow: 1; background: #090d16; position: relative; }
+        .info-panel { font-size: 12px; color: #475569; background: #f1f5f9; border-left: 4px solid #3b82f6; padding: 8px 12px; border-radius: 4px; }
     </style>
+    <!-- Three.js и OrbitControls -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 </head>
@@ -21,22 +26,30 @@
 
     <div class="sidebar">
         <h2>Конвертер чертежей в ЧПУ</h2>
+        
         <div>
-            <label>Тип 3D-моделирования:</label>
+            <label for="processType">Тип 3D-моделирования:</label>
             <select id="processType">
-                <option value="extrude" selected>Плоская деталь -> 3D Extrude</option>
-                <option value="lathe">Токарная деталь -> 3D Revolve</option>
-                <option value="wireframe">Векторный каркас</option>
+                <option value="lathe" selected>Токарная деталь -> 3D Revolve</option>
+                <option value="extrude">Плоская деталь -> 3D Extrude</option>
+                <option value="wireframe">Векторный контур -> Сетка</option>
             </select>
         </div>
+
         <div>
-            <label>Загрузить чертеж (DXF, PNG, JPG):</label>
+            <label for="dxfFile">Загрузить чертеж (DXF, PNG, JPG):</label>
             <input type="file" id="dxfFile" accept=".dxf,.png,.jpg,.jpeg">
         </div>
+
         <button onclick="uploadAndProcess()">Сгенерировать 3D</button>
+
+        <div class="info-panel">
+            <strong>Обработка чертежа:</strong> Для режим токарной детали сканируется профиль относительно центральной оси вращения.
+        </div>
+
         <div>
             <label>Статус обработки:</label>
-            <div id="resultOutput" class="result-box">Загрузите чертеж...</div>
+            <div id="resultOutput" class="result-box">Ожидание загрузки файла...</div>
         </div>
     </div>
 
@@ -48,29 +61,35 @@
 
         function initThree() {
             const container = document.getElementById('canvas-container');
-            container.innerHTML = ''; 
+            container.innerHTML = '';
 
             scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x1a1a1a);
+            scene.background = new THREE.Color(0x090d16);
 
             camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 1, 100000);
-            camera.position.set(0, 150, 300);
+            camera.position.set(0, 100, 250);
 
             renderer = new THREE.WebGLRenderer({ antialias: true });
             renderer.setSize(container.clientWidth, container.clientHeight);
+            renderer.shadowMap.enabled = true;
             container.appendChild(renderer.domElement);
 
-            const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+            // Освещение для токарных металлической деталей
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
             scene.add(ambientLight);
 
             const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
-            dirLight1.position.set(200, 300, 200);
+            dirLight1.position.set(200, 400, 200);
             scene.add(dirLight1);
+
+            const dirLight2 = new THREE.DirectionalLight(0x38bdf8, 0.4);
+            dirLight2.position.set(-200, -200, -200);
+            scene.add(dirLight2);
 
             controls = new THREE.OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
 
-            gridHelper = new THREE.GridHelper(1000, 40, 0x444444, 0x222222);
+            gridHelper = new THREE.GridHelper(1000, 40, 0x1e293b, 0x0f172a);
             scene.add(gridHelper);
 
             window.addEventListener('resize', onWindowResize);
@@ -96,13 +115,14 @@
             const outputBox = document.getElementById('resultOutput');
 
             if (fileInput.files.length === 0) {
-                alert('Выберите файл!');
+                alert('Выберите файл чертежа!');
                 return;
             }
 
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
-            outputBox.textContent = 'Анализ контуров и построение 3D...';
+
+            outputBox.textContent = 'Обработка чертежа и сканирование профиля...';
 
             try {
                 const response = await fetch('/process-dxf', { method: 'POST', body: formData });
@@ -129,14 +149,31 @@
             const group = new THREE.Group();
             group.name = 'dxfGroup';
 
-            const metalMat = new THREE.MeshStandardMaterial({
-                color: 0x90a4ae,
-                metalness: 0.8,
-                roughness: 0.2,
+            // Реалистичный материал обработки металла (токарный станок)
+            const metalMaterial = new THREE.MeshStandardMaterial({
+                color: 0x94a3b8,
+                metalness: 0.85,
+                roughness: 0.25,
                 side: THREE.DoubleSide
             });
 
-            if (mode === 'extrude') {
+            if (mode === 'lathe') {
+                let ptsSource = contours[0];
+                if (ptsSource && ptsSource.length > 1) {
+                    const profilePoints = [];
+                    ptsSource.forEach(p => {
+                        // Vector2(Радиус детали, Положение вдоль оси)
+                        profilePoints.push(new THREE.Vector2(Math.max(0.001, p.y), p.x));
+                    });
+
+                    const latheGeo = new THREE.LatheGeometry(profilePoints, 64);
+                    const latheMesh = new THREE.Mesh(latheGeo, metalMaterial);
+                    
+                    // Поворот детали горизонтально вдоль оси X
+                    latheMesh.rotation.z = -Math.PI / 2;
+                    group.add(latheMesh);
+                }
+            } else if (mode === 'extrude') {
                 contours.forEach(pts => {
                     if (pts.length < 3) return;
                     const shape = new THREE.Shape();
@@ -146,45 +183,29 @@
                     }
                     shape.closePath();
 
-                    const extrudeSettings = { depth: 10, bevelEnabled: true, bevelThickness: 1, bevelSize: 1 };
+                    const extrudeSettings = { depth: 15, bevelEnabled: true, bevelThickness: 1, bevelSize: 1 };
                     const geo = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-                    const mesh = new THREE.Mesh(geo, metalMat);
+                    const mesh = new THREE.Mesh(geo, metalMaterial);
                     mesh.rotation.x = -Math.PI / 2;
                     group.add(mesh);
                 });
-
-            } else if (mode === 'lathe') {
-                // Выбираем самый длинный контур для токарного вращения
-                let bestContour = contours[0];
-                contours.forEach(c => { if (c.length > bestContour.length) bestContour = c; });
-
-                const profilePoints = [];
-                bestContour.forEach(p => {
-                    if (p.y >= 0) profilePoints.push(new THREE.Vector2(p.y, p.x));
-                });
-
-                if (profilePoints.length > 1) {
-                    const latheGeo = new THREE.LatheGeometry(profilePoints, 64);
-                    const latheMesh = new THREE.Mesh(latheGeo, metalMat);
-                    latheMesh.rotation.z = -Math.PI / 2;
-                    group.add(latheMesh);
-                }
             } else {
-                const lineMat = new THREE.LineBasicMaterial({ color: 0x00ff88 });
+                const lineMaterial = new THREE.LineBasicMaterial({ color: 0x38bdf8, linewidth: 2 });
                 contours.forEach(pts => {
-                    const pos = [];
+                    const linePositions = [];
                     for (let i = 0; i < pts.length; i++) {
                         const next = pts[(i + 1) % pts.length];
-                        pos.push(pts[i].x, pts[i].y, 0, next.x, next.y, 0);
+                        linePositions.push(pts[i].x, pts[i].y, 0, next.x, next.y, 0);
                     }
-                    const geo = new THREE.BufferGeometry();
-                    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-                    const lines = new THREE.LineSegments(geo, lineMat);
+                    const geometry = new THREE.BufferGeometry();
+                    geometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
+                    const lines = new THREE.LineSegments(geometry, lineMaterial);
                     lines.rotation.x = -Math.PI / 2;
                     group.add(lines);
                 });
             }
 
+            // Автоматическое центрирование и фокусировка камеры на детали
             const box = new THREE.Box3().setFromObject(group);
             const center = box.getCenter(new THREE.Vector3());
             const size = box.getSize(new THREE.Vector3());
@@ -193,8 +214,8 @@
             scene.add(group);
 
             const maxDim = Math.max(size.x, size.y, size.z);
-            const camDistance = Math.max(maxDim * 2.5, 100);
-            camera.position.set(0, camDistance * 0.7, camDistance);
+            const camDistance = Math.max(maxDim * 2.2, 80);
+            camera.position.set(0, camDistance * 0.6, camDistance);
             camera.lookAt(0, 0, 0);
         }
 
