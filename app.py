@@ -6,26 +6,8 @@ import io
 import math
 import ezdxf
 import ezdxf.recover
-import os
 
-# Проверяем наличие нейросети ultralytics
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-
-app = FastAPI(title="AI CAD Converter - Neural Vision")
-
-# Загрузка нейросети YOLOv8 Segmentation
-# При первом запуске автоматически скачается лёгкая модель (14 МБ)
-yolo_model = None
-if YOLO_AVAILABLE:
-    try:
-        yolo_model = YOLO("yolov8n-seg.pt")
-        print(">>> Нейросеть YOLOv8-seg успешно загружена! <<<")
-    except Exception as e:
-        print(f"Предупреждение: Не удалось загрузить YOLO: {e}")
+app = FastAPI(title="AI CAD Converter - Fast Engine")
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
@@ -35,105 +17,70 @@ async def serve_frontend():
     except FileNotFoundError:
         return "<h1>Ошибка: файл index.html не найден.</h1>"
 
-def process_image_with_yolo(img):
+def clean_engineering_drawing(img_bytes: bytes):
     """
-    Сегментация детали с помощью нейросети.
-    Возвращает маску чистого физического тела детали без размерных стрелок и надписей.
+    Инженерный фильтр чертежей (ГОСТ 2.303-68):
+    - Удаляет тонкие выносные и размерные линии
+    - Фильтрует текст, стрелки и штампы
+    - Находит истинный контур детали
     """
-    h, w, _ = img.shape
-    
-    # Прогон через нейросеть
-    results = yolo_model(img, conf=0.15, verbose=False)
-    
-    detail_mask = None
-    
-    for result in results:
-        if result.masks is not None:
-            masks = result.masks.data.cpu().numpy()
-            
-            # Находим самую крупную маску (тело детали)
-            max_area = 0
-            best_mask = None
-            for mask in masks:
-                mask_resized = cv2.resize(mask, (w, h))
-                area = np.sum(mask_resized > 0.5)
-                if area > max_area:
-                    max_area = area
-                    best_mask = mask_resized
-            
-            if best_mask is not None:
-                detail_mask = (best_mask > 0.5).astype(np.uint8) * 255
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Не удалось прочитать изображение.")
 
-    return detail_mask
-
-def process_image_fallback(img):
-    """
-    Запасной фильтр по толщине линий ГОСТ (если нейросеть не смогла выделить силуэт)
-    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+
+    # 1. Инвертированная бинаризация
     _, binary = cv2.threshold(gray, 210, 255, cv2.THRESH_BINARY_INV)
 
-    # Морфологическое удаление тонких выносных линий и стрелок
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    # 2. Фильтрация тонких линий (стрелки, размеры, штриховка)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     thick_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
 
-    # Выделение главного элемента детали
+    # 3. Выделение главного тела детали (удаление мелких цифр и рамок)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thick_lines)
     clean_mask = np.zeros_like(thick_lines)
-    
-    h, w = gray.shape
+
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         width = stats[i, cv2.CC_STAT_WIDTH]
+        # Отсекаем всё, что меньше 0.3% от площади чертежа
         if area > (w * h * 0.003) and width > (w * 0.05):
             clean_mask[labels == i] = 255
 
-    return clean_mask
-
-def extract_lathe_profile(clean_mask):
-    """Извлечение токарного радиусного профиля из бинарной маски"""
-    h, w = clean_mask.shape
-
-    # Вычисление оси симметрии деталей (центр масс)
+    # 4. Поиск горизонтальной оси симметрии
     M = cv2.moments(clean_mask)
-    if M["m00"] != 0:
-        center_y = int(M["m01"] / M["m00"])
-    else:
-        center_y = h // 2
+    center_y = int(M["m01"] / M["m00"]) if M["m00"] != 0 else h // 2
 
     x_indices = np.where(clean_mask > 0)[1]
     if len(x_indices) == 0:
-        raise ValueError("Не удалось распознать силуэт детали на чертеже.")
+        raise ValueError("Контур детали не найден. Проверьте четкость чертежа.")
 
     min_x, max_x = np.min(x_indices), np.max(x_indices)
 
-    raw_x = []
-    raw_r = []
+    raw_x, raw_r = [], []
+    step = max(1, (max_x - min_x) // 200)
 
-    # Лучевое сканирование профиля детали
-    step = max(1, (max_x - min_x) // 250)
+    # 5. Сканирование радиусного профиля
     for x in range(min_x, max_x, step):
         col = clean_mask[0:center_y, x]
         pixels = np.where(col > 0)[0]
-        
         if len(pixels) > 0:
             top_y = pixels[0]
-            radius = center_y - top_y
             raw_x.append(float(x - min_x))
-            raw_r.append(float(radius))
+            raw_r.append(float(center_y - top_y))
 
-    # Скользящая медианная аппроксимация для получения идеальных цилиндров и конусов
-    window = 9
-    half = window // 2
-    padded = np.pad(raw_r, (half, half), mode='edge')
+    # 6. Медианное сглаживание для ровной поверхности ступеней
+    window = 11
+    padded = np.pad(raw_r, (window // 2, window // 2), mode='edge')
     smoothed_r = [float(np.median(padded[i : i + window])) for i in range(len(raw_r))]
 
-    profile_points = [{"x": x, "y": r} for x, r in zip(raw_x, smoothed_r)]
-
-    return profile_points, center_y
+    profile = [{"x": x, "y": r} for x, r in zip(raw_x, smoothed_r)]
+    return profile, center_y
 
 def process_dxf_file(contents: bytes):
-    """Анализатор векторов DXF"""
     try:
         doc, auditor = ezdxf.recover.read(io.BytesIO(contents))
     except Exception:
@@ -148,7 +95,7 @@ def process_dxf_file(contents: bytes):
         if e_type == 'LINE':
             s, e = entity.dxf.start, entity.dxf.end
             line_style = getattr(entity.dxf, 'linetype', '').upper()
-            layer_name = entity.dxf.layer.upper()
+            layer_name = getattr(entity.dxf, 'layer', '').upper()
             if 'CENTER' in line_style or 'DASHDOT' in line_style or 'DIM' in layer_name:
                 continue
             contours.append([
@@ -176,55 +123,28 @@ def process_dxf_file(contents: bytes):
 async def process_file(file: UploadFile = File(...)):
     filename = file.filename.lower()
     if not filename.endswith(('.dxf', '.png', '.jpg', '.jpeg')):
-        raise HTTPException(status_code=400, detail="Формат не поддерживается. Загрузите DXF, PNG или JPG.")
+        raise HTTPException(status_code=400, detail="Формат не поддерживается.")
 
     contents = await file.read()
 
     try:
         if filename.endswith(('.png', '.jpg', '.jpeg')):
-            nparr = np.frombuffer(contents, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None:
-                raise ValueError("Ошибка чтения изображения.")
-
-            mask = None
-            engine_used = "OpenCV Engineering Filter"
-
-            # 1. Сначала запускаем нейросеть YOLOv8
-            if yolo_model is not None:
-                try:
-                    mask = process_image_with_yolo(img)
-                    if mask is not None:
-                        engine_used = "AI YOLOv8 Neural Network"
-                except Exception as ex:
-                    print(f"Ошибка работы YOLO: {ex}")
-
-            # 2. Если нейросеть не вернула маску, применяем классический фильтр ГОСТ
-            if mask is None:
-                mask = process_image_fallback(img)
-
-            # 3. Извлекаем токарный профиль
-            profile, axis_y = extract_lathe_profile(mask)
-
+            profile, axis_y = clean_engineering_drawing(contents)
             return {
                 "filename": file.filename,
                 "status": "success",
-                "engine": engine_used,
                 "contours_count": 1,
-                "entity_breakdown": {"POINTS_COUNT": len(profile), "AXIS_Y": axis_y},
+                "entity_breakdown": {"POINTS": len(profile), "AXIS_Y": axis_y},
                 "contours": [profile]
             }
-
         else:
             contours, breakdown = process_dxf_file(contents)
             return {
                 "filename": file.filename,
                 "status": "success",
-                "engine": "DXF Vector Parser",
                 "contours_count": len(contours),
                 "entity_breakdown": breakdown,
                 "contours": contours
             }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
