@@ -18,52 +18,67 @@ async def serve_frontend():
         return "<h1>Ошибка: файл index.html не найден.</h1>"
 
 def clean_engineering_drawing(img_bytes: bytes):
-    """
-    Инженерный фильтр чертежей (ГОСТ 2.303-68):
-    - Удаляет тонкие выносные и размерные линии
-    - Фильтрует текст, стрелки и штампы
-    - Находит истинный контур детали
-    """
     nparr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError("Не удалось прочитать изображение.")
+        raise ValueError("Не удалось прочитать файл изображения.")
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
-    # 1. Инвертированная бинаризация
-    _, binary = cv2.threshold(gray, 210, 255, cv2.THRESH_BINARY_INV)
+    # 1. Автоматический бинарный порог Оцу (адаптируется под любой фон и освещение)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 2. Фильтрация тонких линий (стрелки, размеры, штриховка)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    thick_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    # Авто-проверка фонового цвета (если край картинки оказался белым после инверсии)
+    border_pixels = np.concatenate([binary[0, :], binary[-1, :], binary[:, 0], binary[:, -1]])
+    if np.mean(border_pixels) > 127:
+        binary = cv2.bitwise_not(binary)
 
-    # 3. Выделение главного тела детали (удаление мелких цифр и рамок)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thick_lines)
-    clean_mask = np.zeros_like(thick_lines)
+    # 2. Мягкая очистка шума (ядро 2x2 не разрушает тонкие контуры)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    clean_binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
 
+    # 3. Выделение компонентов
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(clean_binary)
+
+    if num_labels <= 1:
+        clean_binary = binary
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(clean_binary)
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    if len(areas) == 0:
+        raise ValueError("Чертеж слишком бледный или не содержит линий.")
+
+    # 4. Поиск детали (мягкий фильтр + автоматический выбор крупного объекта)
+    valid_indices = []
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         width = stats[i, cv2.CC_STAT_WIDTH]
-        # Отсекаем всё, что меньше 0.3% от площади чертежа
-        if area > (w * h * 0.003) and width > (w * 0.05):
-            clean_mask[labels == i] = 255
+        if area > (w * h * 0.0003) or width > (w * 0.02):
+            valid_indices.append(i)
 
-    # 4. Поиск горизонтальной оси симметрии
+    # Если мягкий фильтр отсек всё — берем наибольший объект на изображении
+    if not valid_indices:
+        valid_indices = [np.argmax(areas) + 1]
+
+    clean_mask = np.zeros_like(clean_binary)
+    for idx in valid_indices:
+        clean_mask[labels == idx] = 255
+
+    # 5. Вычисление оси вращения
     M = cv2.moments(clean_mask)
     center_y = int(M["m01"] / M["m00"]) if M["m00"] != 0 else h // 2
 
     x_indices = np.where(clean_mask > 0)[1]
     if len(x_indices) == 0:
-        raise ValueError("Контур детали не найден. Проверьте четкость чертежа.")
+        raise ValueError("Не удалось определить границы контура.")
 
     min_x, max_x = np.min(x_indices), np.max(x_indices)
 
     raw_x, raw_r = [], []
     step = max(1, (max_x - min_x) // 200)
 
-    # 5. Сканирование радиусного профиля
+    # 6. Сканирование радиусов
     for x in range(min_x, max_x, step):
         col = clean_mask[0:center_y, x]
         pixels = np.where(col > 0)[0]
@@ -72,10 +87,23 @@ def clean_engineering_drawing(img_bytes: bytes):
             raw_x.append(float(x - min_x))
             raw_r.append(float(center_y - top_y))
 
-    # 6. Медианное сглаживание для ровной поверхности ступеней
-    window = 11
-    padded = np.pad(raw_r, (window // 2, window // 2), mode='edge')
-    smoothed_r = [float(np.median(padded[i : i + window])) for i in range(len(raw_r))]
+    # Страховочный проход, если верхняя часть детали была перекрыта
+    if not raw_x:
+        for x in range(min_x, max_x, step):
+            col = clean_mask[:, x]
+            pixels = np.where(col > 0)[0]
+            if len(pixels) > 0:
+                radius = (pixels[-1] - pixels[0]) / 2.0
+                raw_x.append(float(x - min_x))
+                raw_r.append(float(radius))
+
+    # Медианное сглаживание ступеней
+    window = 7
+    if len(raw_r) >= window:
+        padded = np.pad(raw_r, (window // 2, window // 2), mode='edge')
+        smoothed_r = [float(np.median(padded[i : i + window])) for i in range(len(raw_r))]
+    else:
+        smoothed_r = raw_r
 
     profile = [{"x": x, "y": r} for x, r in zip(raw_x, smoothed_r)]
     return profile, center_y
