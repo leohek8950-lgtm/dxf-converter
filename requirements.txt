@@ -3,6 +3,4 @@ uvicorn
 python-multipart
 opencv-python-headless
 ezdxf
-ultralytics
-torch
-torchvision
+numpy
