@@ -3,22 +3,14 @@ import io
 import json
 import re
 import math
+import base64
+import requests
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse
-from PIL import Image
 import ezdxf
 import ezdxf.recover
-import google.generativeai as genai
 
-app = FastAPI(title="AI CAD Converter - Gemini Vision Engine")
-
-# Безопасная инициализация API Ключа
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-    except Exception as e:
-        print(f"Ошибка конфигурации Gemini API: {e}")
+app = FastAPI(title="AI CAD Converter - Fast Rest Engine")
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
@@ -31,14 +23,10 @@ async def serve_frontend():
 def analyze_drawing_with_gemini(img_bytes: bytes):
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY не найден в Environment Variables!")
+        raise ValueError("GEMINI_API_KEY не установлен в Environment Variables!")
 
-    genai.configure(api_key=api_key)
-
-    try:
-        image = Image.open(io.BytesIO(img_bytes))
-    except Exception:
-        raise ValueError("Не удалось прочитать загруженное изображение.")
+    # Конвертируем изображение в Base64
+    base64_image = base64.b64encode(img_bytes).decode("utf-8")
 
     prompt = """
     Ты — инженер-конструктор и эксперт по распознаванию чертежей токарных деталей.
@@ -59,37 +47,52 @@ def analyze_drawing_with_gemini(img_bytes: bytes):
     Передай от 20 до 60 ключевых точек ступеней контура.
     """
 
-    # Подбор доступной модели в порядке приоритета
-    candidate_models = [
-        'gemini-1.5-flash',
-        'gemini-1.5-flash-latest',
-        'gemini-1.5-pro'
+    # Список актуальных эндпоинтов Gemini REST API
+    endpoints = [
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
     ]
 
-    response = None
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": base64_image
+                    }
+                }
+            ]
+        }]
+    }
+
+    response_text = None
     last_error = None
 
-    for model_name in candidate_models:
+    for url in endpoints:
         try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content([image, prompt])
-            if response and response.text:
+            res = requests.post(url, json=payload, timeout=30)
+            if res.status_code == 200:
+                res_data = res.json()
+                response_text = res_data['candidates'][0]['content']['parts'][0]['text']
                 break
-        except Exception as err:
-            last_error = err
-            continue
+            else:
+                last_error = f"HTTP {res.status_code}: {res.text}"
+        except Exception as e:
+            last_error = str(e)
 
-    if not response or not response.text:
-        raise ValueError(f"Ошибка ИИ: {str(last_error)}")
+    if not response_text:
+        raise ValueError(f"Ошибка вызова Gemini REST API: {last_error}")
 
-    text_content = response.text.strip()
-    clean_json = re.sub(r'```json\s*|\s*```', '', text_content).strip()
+    # Очистка ответа от ```json ... ```
+    clean_json = re.sub(r'```json\s*|\s*```', '', response_text).strip()
 
     try:
         profile = json.loads(clean_json)
         return profile
     except Exception:
-        raise ValueError("ИИ вернул ответ в некорректном формате JSON.")
+        raise ValueError("ИИ вернул ответ в неверном формате JSON.")
 
 def process_dxf_file(contents: bytes):
     try:
@@ -145,7 +148,7 @@ async def process_file(file: UploadFile = File(...)):
                 "filename": file.filename,
                 "status": "success",
                 "contours_count": 1,
-                "entity_breakdown": {"GEMINI_AI": True, "POINTS_COUNT": len(profile)},
+                "entity_breakdown": {"GEMINI_REST_API": True, "POINTS_COUNT": len(profile)},
                 "contours": [profile]
             }
         else:
