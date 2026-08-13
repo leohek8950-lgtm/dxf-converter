@@ -1,13 +1,21 @@
+import os
+import io
+import json
+import re
+import math
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse
-import cv2
-import numpy as np
-import io
-import math
+import google.generativeai as genai
+from PIL import Image
 import ezdxf
 import ezdxf.recover
 
-app = FastAPI(title="AI CAD Converter - Fast Engine")
+app = FastAPI(title="AI CAD Converter - Gemini Vision Engine")
+
+# Настройка подключения к Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
@@ -17,96 +25,48 @@ async def serve_frontend():
     except FileNotFoundError:
         return "<h1>Ошибка: файл index.html не найден.</h1>"
 
-def clean_engineering_drawing(img_bytes: bytes):
-    nparr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Не удалось прочитать файл изображения.")
+def analyze_drawing_with_gemini(img_bytes: bytes):
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY не установлен в Environment Variables на Render!")
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
+    try:
+        image = Image.open(io.BytesIO(img_bytes))
+    except Exception:
+        raise ValueError("Ошибка чтения файла изображения.")
 
-    # 1. Автоматический бинарный порог Оцу (адаптируется под любой фон и освещение)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Используем супер-быструю и бесплатную Vision-модель Gemini
+    model = genai.GenerativeModel('gemini-1.5-flash')
 
-    # Авто-проверка фонового цвета (если край картинки оказался белым после инверсии)
-    border_pixels = np.concatenate([binary[0, :], binary[-1, :], binary[:, 0], binary[:, -1]])
-    if np.mean(border_pixels) > 127:
-        binary = cv2.bitwise_not(binary)
+    prompt = """
+    Ты — инженер-конструктор и эксперт по распознаванию чертежей токарных деталей.
+    Проанализируй чертеж детали вращения:
+    1. ПОЛНОСТЬЮ ИГНОРИРУЙ все выносные линии, размерные стрелки, допуски, тексты, рамку и штамп чертежа.
+    2. Определи центральную ось вращения детали.
+    3. Найди верхний контур металлической детали (радиусный профиль) от левого до правого края.
+    4. Сформируй координаты ступеней/переходов детали слева направо.
+    
+    Верни ТОЛЬКО чистый JSON-массив без markdown-тегов и текста в формате:
+    [
+      {"x": 0, "y": 15},
+      {"x": 20, "y": 15},
+      {"x": 20, "y": 25},
+      {"x": 60, "y": 25}
+    ]
+    где 'x' — координата по длине (растет от 0), а 'y' — радиус детали относительно оси.
+    Передай от 20 до 60 ключевых точек ступеней контура.
+    """
 
-    # 2. Мягкая очистка шума (ядро 2x2 не разрушает тонкие контуры)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    clean_binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    response = model.generate_content([image, prompt])
+    text_content = response.text.strip()
 
-    # 3. Выделение компонентов
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(clean_binary)
+    # Очистка JSON от возможных знаков разметки ```json ... ```
+    clean_json = re.sub(r'```json\s*|\s*```', '', text_content).strip()
 
-    if num_labels <= 1:
-        clean_binary = binary
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(clean_binary)
-
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    if len(areas) == 0:
-        raise ValueError("Чертеж слишком бледный или не содержит линий.")
-
-    # 4. Поиск детали (мягкий фильтр + автоматический выбор крупного объекта)
-    valid_indices = []
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        width = stats[i, cv2.CC_STAT_WIDTH]
-        if area > (w * h * 0.0003) or width > (w * 0.02):
-            valid_indices.append(i)
-
-    # Если мягкий фильтр отсек всё — берем наибольший объект на изображении
-    if not valid_indices:
-        valid_indices = [np.argmax(areas) + 1]
-
-    clean_mask = np.zeros_like(clean_binary)
-    for idx in valid_indices:
-        clean_mask[labels == idx] = 255
-
-    # 5. Вычисление оси вращения
-    M = cv2.moments(clean_mask)
-    center_y = int(M["m01"] / M["m00"]) if M["m00"] != 0 else h // 2
-
-    x_indices = np.where(clean_mask > 0)[1]
-    if len(x_indices) == 0:
-        raise ValueError("Не удалось определить границы контура.")
-
-    min_x, max_x = np.min(x_indices), np.max(x_indices)
-
-    raw_x, raw_r = [], []
-    step = max(1, (max_x - min_x) // 200)
-
-    # 6. Сканирование радиусов
-    for x in range(min_x, max_x, step):
-        col = clean_mask[0:center_y, x]
-        pixels = np.where(col > 0)[0]
-        if len(pixels) > 0:
-            top_y = pixels[0]
-            raw_x.append(float(x - min_x))
-            raw_r.append(float(center_y - top_y))
-
-    # Страховочный проход, если верхняя часть детали была перекрыта
-    if not raw_x:
-        for x in range(min_x, max_x, step):
-            col = clean_mask[:, x]
-            pixels = np.where(col > 0)[0]
-            if len(pixels) > 0:
-                radius = (pixels[-1] - pixels[0]) / 2.0
-                raw_x.append(float(x - min_x))
-                raw_r.append(float(radius))
-
-    # Медианное сглаживание ступеней
-    window = 7
-    if len(raw_r) >= window:
-        padded = np.pad(raw_r, (window // 2, window // 2), mode='edge')
-        smoothed_r = [float(np.median(padded[i : i + window])) for i in range(len(raw_r))]
-    else:
-        smoothed_r = raw_r
-
-    profile = [{"x": x, "y": r} for x, r in zip(raw_x, smoothed_r)]
-    return profile, center_y
+    try:
+        profile = json.loads(clean_json)
+        return profile
+    except Exception:
+        raise ValueError(f"ИИ вернул некорректный ответ. Попробуйте еще раз.")
 
 def process_dxf_file(contents: bytes):
     try:
@@ -157,12 +117,13 @@ async def process_file(file: UploadFile = File(...)):
 
     try:
         if filename.endswith(('.png', '.jpg', '.jpeg')):
-            profile, axis_y = clean_engineering_drawing(contents)
+            # Вызов нейросети Gemini Vision
+            profile = analyze_drawing_with_gemini(contents)
             return {
                 "filename": file.filename,
                 "status": "success",
                 "contours_count": 1,
-                "entity_breakdown": {"POINTS": len(profile), "AXIS_Y": axis_y},
+                "entity_breakdown": {"GEMINI_AI": True, "POINTS_COUNT": len(profile)},
                 "contours": [profile]
             }
         else:
@@ -175,4 +136,4 @@ async def process_file(file: UploadFile = File(...)):
                 "contours": contours
             }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
