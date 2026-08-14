@@ -10,7 +10,6 @@ import cadquery as cq
 
 app = FastAPI(title="Precision AI CAD Engine")
 
-# Создаем папку для экспорта файлов STEP и STL
 EXPORTS_DIR = "exports"
 os.makedirs(EXPORTS_DIR, exist_ok=True)
 
@@ -25,37 +24,57 @@ async def serve_index():
 def parse_drawing_with_gemini(img_bytes: bytes):
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY не установлен в Environment Variables на сервере!")
+        raise ValueError("GEMINI_API_KEY не установлен!")
 
     base64_image = base64.b64encode(img_bytes).decode("utf-8")
 
+    # ЖЕСТКИЙ ИНЖЕНЕРНЫЙ ПРОМПТ С ЦЕПОЧКОЙ РАССУЖДЕНИЙ
     prompt = """
-    Ты — главный инженер-технолог по ЧПУ и эксперт по чтению машиностроительных чертежей ISO/ГОСТ.
-    Проанализируй чертеж и извлеки ПОЛНУЮ точную геометрию детали.
+    Ты — ведущий инженер-конструктор ЧПУ. Твоя задача — идеально прочитать чертеж токарной детали и извлечь все до единого размеры.
 
-    Верни ТОЛЬКО чистый валидный JSON без markdown-тегов в следующем формате:
+    ВНИМАТЕЛЬНО ИЗУЧИ ЧЕРТЕЖ СЛЕВА НАПРАВО:
+    1. Найди общую длину (например, 61 мм).
+    2. Разбей внешнюю геометрию на элементы (конусы и цилиндры):
+       - Указывай 'start_diameter' и 'end_diameter' для КАЖДОГО участка. 
+       - Если участок цилиндрический, start_diameter == end_diameter.
+       - Если участок конический (например, с Ø4.5 до Ø18), укажи начальный и конечный диаметры и его длину (23.5 мм).
+    3. Найди внутреннее отверстие:
+       - Извлеки диаметр (например, Ø8).
+       - Извлеки глубину глухого отверстия (например, 26.5 мм от правого торца).
+
+    Верни ТОЛЬКО валидный JSON без текста и markdown-тегов:
     {
-      "part_name": "Деталь",
-      "type": "revolve",
-      "axis_steps": [
-        {"diameter": 50.0, "length": 30.0},
-        {"diameter": 35.0, "length": 40.0},
-        {"diameter": 20.0, "length": 20.0}
+      "part_name": "Токарная деталь",
+      "total_length": 61.0,
+      "outer_profile": [
+        {
+          "type": "cone",
+          "start_diameter": 4.5,
+          "end_diameter": 18.0,
+          "length": 23.5
+        },
+        {
+          "type": "cylinder",
+          "start_diameter": 18.0,
+          "end_diameter": 18.0,
+          "length": 16.0
+        },
+        {
+          "type": "cone",
+          "start_diameter": 18.0,
+          "end_diameter": 16.0,
+          "length": 21.5
+        }
       ],
-      "inner_bore": {
-        "diameter": 16.0,
-        "through": true
-      },
-      "chamfers": [
-        {"size": 1.5, "location": "front_outer"}
+      "bores": [
+        {
+          "diameter": 8.0,
+          "depth": 26.5,
+          "from_side": "right"
+        }
       ]
     }
-
-    Требования:
-    1. Все размеры указывай строго в миллиметрах (мм).
-    2. 'axis_steps' описывает внешние цилиндрические/конические ступени детали слева направо.
-    3. 'inner_bore' описывает центральное внутреннее отверстие (если есть).
-    4. Игнорируй рамки чертежа, штамп, текстовые примечания и выносные стрелки — учитывай только точную геометрию тела детали.
+    Соблюдай абсолютную точность всех чисел в миллиметрах (мм)!
     """
 
     payload = {
@@ -67,12 +86,9 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         }]
     }
 
-    # Поочередный перебор эндпоинтов Google Gemini
     endpoints = [
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
         f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
     ]
 
@@ -91,42 +107,83 @@ def parse_drawing_with_gemini(img_bytes: bytes):
             last_error = str(e)
 
     if not res_data:
-        raise ValueError(f"Ошибка ИИ при запросе к Gemini API: {last_error}")
+        raise ValueError(f"Ошибка ИИ: {last_error}")
 
     try:
         text_content = res_data['candidates'][0]['content']['parts'][0]['text']
         clean_json = re.sub(r'```json\s*|\s*```', '', text_content).strip()
         return json.loads(clean_json)
     except Exception as parse_err:
-        raise ValueError(f"Ошибка парсинга JSON от ИИ: {parse_err}")
+        raise ValueError(f"Ошибка парсинга ответа ИИ: {parse_err}")
 
 def build_cad_model(spec: dict, filename_base: str):
-    """Построение точной CAD-модели с помощью ядра CadQuery (OpenCASCADE)"""
-    steps = spec.get("axis_steps", [])
-    if not steps:
-        raise ValueError("В ответе ИИ не найдены геометрические ступени детали (axis_steps).")
+    """Генерация высокой точности в CadQuery (поддержка конусов и глухих отверстий)"""
+    profile = spec.get("outer_profile", [])
+    if not profile:
+        raise ValueError("В ответе ИИ не найден профиль детали.")
 
     current_z = 0.0
     result = None
 
-    # 1. Построение внешнего контура (ступеней детали)
-    for step in steps:
-        r = float(step.get("diameter", 10.0)) / 2.0
-        l = float(step.get("length", 10.0))
-        cyl = cq.Workplane("XY").workplane(offset=current_z).circle(r).extrude(l)
-        if result is None:
-            result = cyl
+    # 1. Построение внешних ступеней и конусов
+    for seg in profile:
+        d1 = float(seg.get("start_diameter", 10.0))
+        d2 = float(seg.get("end_diameter", 10.0))
+        l = float(seg.get("length", 10.0))
+
+        if l <= 0:
+            continue
+
+        r1 = d1 / 2.0
+        r2 = d2 / 2.0
+
+        if abs(r1 - r2) < 0.001:
+            # Обычный цилиндр
+            solid = cq.Workplane("XY").workplane(offset=current_z).circle(r1).extrude(l)
         else:
-            result = result.union(cyl)
+            # Коническая секция (Loft)
+            solid = (
+                cq.Workplane("XY")
+                .workplane(offset=current_z)
+                .circle(r1)
+                .workplane(offset=l)
+                .circle(r2)
+                .loft(combine=True)
+            )
+
+        if result is None:
+            result = solid
+        else:
+            result = result.union(solid)
+
         current_z += l
 
-    # 2. Выполнение сквозного или глухого центрального отверстия
-    bore = spec.get("inner_bore")
-    if bore and float(bore.get("diameter", 0)) > 0:
-        bore_r = float(bore["diameter"]) / 2.0
-        result = result.faces("<Z").workplane().circle(bore_r).cutThruAll()
+    # 2. Выполнение внутреннего глухого или сквозного отверстия
+    bores = spec.get("bores", [])
+    for bore in bores:
+        bd = float(bore.get("diameter", 0))
+        depth = float(bore.get("depth", 0))
+        from_side = bore.get("from_side", "right")
 
-    # 3. Экспорт в промышленные форматы STEP и STL
+        if bd > 0 and depth > 0:
+            br = bd / 2.0
+            if from_side == "right":
+                # Сверление с правого торца
+                result = (
+                    result.faces(">Z")
+                    .workplane()
+                    .circle(br)
+                    .hole(radius=br, depth=depth)
+                )
+            else:
+                # Сверление с левого торца
+                result = (
+                    result.faces("<Z")
+                    .workplane()
+                    .circle(br)
+                    .hole(radius=br, depth=depth)
+                )
+
     step_path = os.path.join(EXPORTS_DIR, f"{filename_base}.step")
     stl_path = os.path.join(EXPORTS_DIR, f"{filename_base}.stl")
 
@@ -137,18 +194,11 @@ def build_cad_model(spec: dict, filename_base: str):
 
 @app.post("/api/analyze")
 async def analyze_file(file: UploadFile = File(...)):
-    filename = file.filename.lower()
-    if not filename.endswith(('.png', '.jpg', '.jpeg')):
-        raise HTTPException(status_code=400, detail="Поддерживаются только изображения чертежей (PNG, JPG, JPEG).")
-
     contents = await file.read()
     filename_base = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(file.filename)[0])
 
     try:
-        # Распознавание геометрических параметров ИИ
         spec = parse_drawing_with_gemini(contents)
-
-        # Генерация 3D STEP и STL моделей
         step_file, stl_file = build_cad_model(spec, filename_base)
 
         return {
@@ -165,4 +215,4 @@ async def download_file(filename: str):
     file_path = os.path.join(EXPORTS_DIR, filename)
     if os.path.exists(file_path):
         return FileResponse(file_path)
-    raise HTTPException(status_code=404, detail="Запрошенный файл не найден.")
+    raise HTTPException(status_code=404, detail="Файл не найден.")
