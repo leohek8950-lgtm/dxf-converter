@@ -24,20 +24,20 @@ async def serve_index():
 def parse_drawing_with_gemini(img_bytes: bytes):
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY не установлен!")
+        raise ValueError("GEMINI_API_KEY не установлен в Environment Variables!")
 
     base64_image = base64.b64encode(img_bytes).decode("utf-8")
 
-    # ЖЕСТКИЙ ИНЖЕНЕРНЫЙ ПРОМПТ С ЦЕПОЧКОЙ РАССУЖДЕНИЙ
+    # Системный инженерный промпт для разбора конусов, цилиндров и глухих отверстий
     prompt = """
     Ты — ведущий инженер-конструктор ЧПУ. Твоя задача — идеально прочитать чертеж токарной детали и извлечь все до единого размеры.
 
     ВНИМАТЕЛЬНО ИЗУЧИ ЧЕРТЕЖ СЛЕВА НАПРАВО:
-    1. Найди общую длину (например, 61 мм).
+    1. Найди общую длину детали (например, 61 мм).
     2. Разбей внешнюю геометрию на элементы (конусы и цилиндры):
        - Указывай 'start_diameter' и 'end_diameter' для КАЖДОГО участка. 
        - Если участок цилиндрический, start_diameter == end_diameter.
-       - Если участок конический (например, с Ø4.5 до Ø18), укажи начальный и конечный диаметры и его длину (23.5 мм).
+       - Если участок конический (например, с Ø4.5 до Ø18), укажи начальный и конечный диаметры и его длину (например, 23.5 мм).
     3. Найди внутреннее отверстие:
        - Извлеки диаметр (например, Ø8).
        - Извлеки глубину глухого отверстия (например, 26.5 мм от правого торца).
@@ -89,6 +89,8 @@ def parse_drawing_with_gemini(img_bytes: bytes):
     endpoints = [
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
         f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={api_key}"
     ]
 
@@ -111,108 +113,4 @@ def parse_drawing_with_gemini(img_bytes: bytes):
 
     try:
         text_content = res_data['candidates'][0]['content']['parts'][0]['text']
-        clean_json = re.sub(r'```json\s*|\s*```', '', text_content).strip()
-        return json.loads(clean_json)
-    except Exception as parse_err:
-        raise ValueError(f"Ошибка парсинга ответа ИИ: {parse_err}")
-
-def build_cad_model(spec: dict, filename_base: str):
-    """Генерация высокой точности в CadQuery (поддержка конусов и глухих отверстий)"""
-    profile = spec.get("outer_profile", [])
-    if not profile:
-        raise ValueError("В ответе ИИ не найден профиль детали.")
-
-    current_z = 0.0
-    result = None
-
-    # 1. Построение внешних ступеней и конусов
-    for seg in profile:
-        d1 = float(seg.get("start_diameter", 10.0))
-        d2 = float(seg.get("end_diameter", 10.0))
-        l = float(seg.get("length", 10.0))
-
-        if l <= 0:
-            continue
-
-        r1 = d1 / 2.0
-        r2 = d2 / 2.0
-
-        if abs(r1 - r2) < 0.001:
-            # Обычный цилиндр
-            solid = cq.Workplane("XY").workplane(offset=current_z).circle(r1).extrude(l)
-        else:
-            # Коническая секция (Loft)
-            solid = (
-                cq.Workplane("XY")
-                .workplane(offset=current_z)
-                .circle(r1)
-                .workplane(offset=l)
-                .circle(r2)
-                .loft(combine=True)
-            )
-
-        if result is None:
-            result = solid
-        else:
-            result = result.union(solid)
-
-        current_z += l
-
-    # 2. Выполнение внутреннего глухого или сквозного отверстия
-    bores = spec.get("bores", [])
-    for bore in bores:
-        bd = float(bore.get("diameter", 0))
-        depth = float(bore.get("depth", 0))
-        from_side = bore.get("from_side", "right")
-
-        if bd > 0 and depth > 0:
-            br = bd / 2.0
-            if from_side == "right":
-                # Сверление с правого торца
-                result = (
-                    result.faces(">Z")
-                    .workplane()
-                    .circle(br)
-                    .hole(radius=br, depth=depth)
-                )
-            else:
-                # Сверление с левого торца
-                result = (
-                    result.faces("<Z")
-                    .workplane()
-                    .circle(br)
-                    .hole(radius=br, depth=depth)
-                )
-
-    step_path = os.path.join(EXPORTS_DIR, f"{filename_base}.step")
-    stl_path = os.path.join(EXPORTS_DIR, f"{filename_base}.stl")
-
-    cq.exporters.export(result, step_path)
-    cq.exporters.export(result, stl_path)
-
-    return step_path, stl_path
-
-@app.post("/api/analyze")
-async def analyze_file(file: UploadFile = File(...)):
-    contents = await file.read()
-    filename_base = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(file.filename)[0])
-
-    try:
-        spec = parse_drawing_with_gemini(contents)
-        step_file, stl_file = build_cad_model(spec, filename_base)
-
-        return {
-            "status": "success",
-            "spec": spec,
-            "stl_url": f"/download/{filename_base}.stl",
-            "step_url": f"/download/{filename_base}.step"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-    file_path = os.path.join(EXPORTS_DIR, filename)
-    if os.path.exists(file_path):
-        return FileResponse(file_path)
-    raise HTTPException(status_code=404, detail="Файл не найден.")
+        clean_json = re.sub(r'```json\s*|\s*
