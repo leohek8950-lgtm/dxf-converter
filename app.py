@@ -24,14 +24,14 @@ async def serve_index():
         return "<h1>Ошибка: файл index.html не найден.</h1>"
 
 def compress_image_bytes(img_bytes: bytes, max_dim=800) -> bytes:
-    """Оптимизация чертежа до 800px для молниеносного отклика Gemini API (3-5 сек)"""
+    """Уменьшает картинку для молниеносного отклика Gemini API"""
     try:
         img = Image.open(io.BytesIO(img_bytes))
         img.thumbnail((max_dim, max_dim))
         buf = io.BytesIO()
         if img.mode != 'RGB':
             img = img.convert('RGB')
-        img.save(buf, format='JPEG', quality=75)
+        img.save(buf, format='JPEG', quality=80)
         return buf.getvalue()
     except Exception:
         return img_bytes
@@ -54,7 +54,7 @@ def parse_drawing_with_gemini(img_bytes: bytes):
        L_паза = L_общее - Sum(L_остальных_известных_сегментов).
     3. Используй ТОЛЬКО номинальные размеры (без допусков ±).
 
-    Верни ТОЛЬКО валидный JSON без markdown:
+    Верни ТОЛЬКО чистый JSON без markdown:
     {
       "part_name": "Деталь",
       "total_length": 45.0,
@@ -88,26 +88,29 @@ def parse_drawing_with_gemini(img_bytes: bytes):
     }
 
     models_to_try = [
-        ("v1beta", "gemini-2.5-flash"),
+        ("v1beta", "gemini-1.5-flash"),
         ("v1beta", "gemini-2.0-flash")
     ]
 
     last_err = None
     for api_ver, model_name in models_to_try:
-        url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model_name}:generateContent"
+        url = f"[https://generativelanguage.googleapis.com/](https://generativelanguage.googleapis.com/){api_ver}/models/{model_name}:generateContent"
         params = {"key": api_key}
         try:
-            res = requests.post(url, params=params, json=payload, timeout=15)
+            res = requests.post(url, params=params, json=payload, timeout=20)
             if res.status_code == 200:
                 res_data = res.json()
                 text_content = res_data['candidates'][0]['content']['parts'][0]['text']
-                return json.loads(text_content.strip())
+                
+                # Очистка от возможных markdown разметок ```json ... ```
+                cleaned_text = re.sub(r'```json\s*|\s*```', '', text_content.strip())
+                return json.loads(cleaned_text)
             else:
                 last_err = f"[{model_name}] HTTP {res.status_code}: {res.text}"
         except Exception as e:
             last_err = f"[{model_name}] {str(e)}"
 
-    raise ValueError(f"Ошибка ИИ: {last_err}")
+    raise ValueError(f"Ошибка обращения к ИИ: {last_err}")
 
 def build_cad_model(spec: dict, filename_base: str):
     profile = spec.get("outer_profile", [])
@@ -117,38 +120,45 @@ def build_cad_model(spec: dict, filename_base: str):
     current_z = 0.0
     result = None
 
-    # 1. Построение наружного контура
+    # 1. Построение наружного контура с защитой от сбоев
     for seg in profile:
         d1 = float(seg.get("start_diameter", 10.0))
-        d2 = float(seg.get("end_diameter", 10.0))
-        l = float(seg.get("length", 10.0))
+        d2 = float(seg.get("end_diameter", d1))
+        l = float(seg.get("length", 0.0))
 
-        if l <= 0:
+        if l <= 0.001:
             continue
 
-        r1 = d1 / 2.0
-        r2 = d2 / 2.0
+        r1 = max(d1 / 2.0, 0.1)
+        r2 = max(d2 / 2.0, 0.1)
 
-        if abs(r1 - r2) < 0.001:
-            solid = cq.Workplane("XY").workplane(offset=current_z).circle(r1).extrude(l)
-        else:
-            solid = (
-                cq.Workplane("XY")
-                .workplane(offset=current_z)
-                .circle(r1)
-                .workplane(offset=l)
-                .circle(r2)
-                .loft(combine=True)
-            )
+        try:
+            if abs(r1 - r2) < 0.001:
+                solid = cq.Workplane("XY").workplane(offset=current_z).circle(r1).extrude(l)
+            else:
+                solid = (
+                    cq.Workplane("XY")
+                    .workplane(offset=current_z)
+                    .circle(r1)
+                    .workplane(offset=l)
+                    .circle(r2)
+                    .loft(combine=True)
+                )
 
-        if result is None:
-            result = solid
-        else:
-            result = result.union(solid)
+            if result is None:
+                result = solid
+            else:
+                result = result.union(solid)
+        except Exception as e:
+            print(f"Пропущен невалидный элемент профиля ({seg}): {e}")
+            continue
 
         current_z += l
 
-    # 2. Выполнение внутренних ступенчатых расточек
+    if result is None:
+        raise ValueError("Не удалось построить геометрию из переданного JSON.")
+
+    # 2. Выполнение внутренних расточек
     bores = spec.get("bores", [])
     bores_sorted = sorted(bores, key=lambda x: float(x.get("diameter", 0)), reverse=True)
 
@@ -158,10 +168,13 @@ def build_cad_model(spec: dict, filename_base: str):
         from_side = bore.get("from_side", "right")
 
         if bd > 0 and depth > 0:
-            if from_side == "right":
-                result = result.faces(">Z").workplane().hole(bd, depth)
-            else:
-                result = result.faces("<Z").workplane().hole(bd, depth)
+            try:
+                if from_side == "right":
+                    result = result.faces(">Z").workplane().hole(bd, depth)
+                else:
+                    result = result.faces("<Z").workplane().hole(bd, depth)
+            except Exception as e:
+                print(f"Ошибка при расточке ({bore}): {e}")
 
     step_path = os.path.join(EXPORTS_DIR, f"{filename_base}.step")
     stl_path = os.path.join(EXPORTS_DIR, f"{filename_base}.stl")
@@ -181,7 +194,7 @@ async def analyze_file(file: UploadFile = File(...)):
             clean_name = "cad_model"
         filename_base = f"part_{clean_name}"
 
-        # Запуск тяжелых функций в потоке без блокировки сервера
+        # Запуск тяжелых вычислений в потоке
         spec = await asyncio.to_thread(parse_drawing_with_gemini, contents)
         step_file, stl_file = await asyncio.to_thread(build_cad_model, spec, filename_base)
 
@@ -192,9 +205,14 @@ async def analyze_file(file: UploadFile = File(...)):
             "step_url": f"/download/{filename_base}.step"
         })
     except Exception as e:
+        # Возвращаем статус 200 с полем ошибки, чтобы фронтенд вывел подробности в JSON-интерфейсе
         return JSONResponse(
-            status_code=500,
-            content={"error": str(e), "message": f"Ошибка обработки: {str(e)}"}
+            status_code=200,
+            content={
+                "status": "error",
+                "error": str(e),
+                "message": f"Ошибка обработки: {str(e)}"
+            }
         )
 
 @app.get("/download/{filename}")
