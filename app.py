@@ -29,22 +29,18 @@ def parse_drawing_with_gemini(img_bytes: bytes):
     api_key = re.sub(r'\[.*?\]|\(|\)', '', api_key).strip()
     base64_image = base64.b64encode(img_bytes).decode("utf-8")
 
+    # ОБНОВЛЕННЫЙ ПРОМПТ С УЧЕТОМ ФАСОК И УСТУПОВ
     prompt = """
-    Ты — ведущий инженер-конструктор ЧПУ. Твоя задача — идеально прочитать чертеж токарной детали и извлечь все до единого размеры.
+    Ты — главный инженер-технолог по ЧПУ. Твоя задача — с ювелирной точностью распознать ВСЕ геометрические элементы детали на чертеже, ВКЛЮЧАЯ ФАСКИ И ПЕРЕХОДЫ.
 
-    ВНИМАТЕЛЬНО ИЗУЧИ ЧЕРТЕЖ СЛЕВА НАПРАВО:
-    1. Найди общую длину детали (например, 61 мм).
-    2. Разбей внешнюю геометрию на элементы (конусы и цилиндры):
-       - Указывай 'start_diameter' и 'end_diameter' для КАЖДОГО участка. 
-       - Если участок цилиндрический, start_diameter == end_diameter.
-       - Если участок конический (например, с Ø4.5 до Ø18), укажи начальный и конечный диаметры и его длину (например, 23.5 мм).
-    3. Найди внутреннее отверстие:
-       - Извлеки диаметр (например, Ø8).
-       - Извлеки глубину глухого отверстия (например, 26.5 мм от правого торца).
+    ВНИМАТЕЛЬНО ИЗУЧИ КОНТУР СЛЕВА НАПРАВО:
+    1. Не пропускай ФАСКИ (chamfers) и технологические скосы на торцах и переходах между диаметрами!
+    2. Если между цилиндром и следующим участком есть фаска или уступ, ОБЯЗАТЕЛЬНО внеси её в 'outer_profile' как отдельный короткий конический элемент.
+    3. Для каждого элемента указывай 'start_diameter', 'end_diameter' и 'length'.
 
-    Верни ТОЛЬКО валидный JSON без текста и markdown-тегов:
+    Пример детали с фасками и конусами:
     {
-      "part_name": "Токарная деталь",
+      "part_name": "Деталь с фасками",
       "total_length": 61.0,
       "outer_profile": [
         {
@@ -57,11 +53,17 @@ def parse_drawing_with_gemini(img_bytes: bytes):
           "type": "cylinder",
           "start_diameter": 18.0,
           "end_diameter": 18.0,
-          "length": 16.0
+          "length": 14.5
+        },
+        {
+          "type": "chamfer",
+          "start_diameter": 18.0,
+          "end_diameter": 16.5,
+          "length": 1.5
         },
         {
           "type": "cone",
-          "start_diameter": 18.0,
+          "start_diameter": 16.5,
           "end_diameter": 16.0,
           "length": 21.5
         }
@@ -74,7 +76,7 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         }
       ]
     }
-    Соблюдай абсолютную точность всех чисел в миллиметрах (мм)!
+    Строго соблюдай все размеры в миллиметрах (мм)! Верни ТОЛЬКО валидный JSON без внешнего текста.
     """
 
     payload = {
@@ -116,7 +118,6 @@ def parse_drawing_with_gemini(img_bytes: bytes):
 
     try:
         text_content = res_data['candidates'][0]['content']['parts'][0]['text']
-        # Безопасная очистка JSON с помощью регулярного выражения без опасных кавычек
         match = re.search(r'\{.*\}', text_content, re.DOTALL)
         if match:
             clean_json = match.group(0)
@@ -127,7 +128,7 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         raise ValueError(f"Ошибка парсинга ответа ИИ: {parse_err}")
 
 def build_cad_model(spec: dict, filename_base: str):
-    """Генерация точной CAD-модели в CadQuery (поддержка конусов, цилиндров и глухих отверстий)"""
+    """Генерация точной CAD-модели с учетом всех фасок, конусов и отверстий"""
     profile = spec.get("outer_profile", [])
     if not profile:
         raise ValueError("В ответе ИИ не найден профиль детали.")
@@ -135,7 +136,7 @@ def build_cad_model(spec: dict, filename_base: str):
     current_z = 0.0
     result = None
 
-    # 1. Построение внешних ступеней и конусов
+    # 1. Построение внешних ступеней, фасок и конусов
     for seg in profile:
         d1 = float(seg.get("start_diameter", 10.0))
         d2 = float(seg.get("end_diameter", 10.0))
@@ -148,10 +149,10 @@ def build_cad_model(spec: dict, filename_base: str):
         r2 = d2 / 2.0
 
         if abs(r1 - r2) < 0.001:
-            # Цилиндр
+            # Цилиндрический участок
             solid = cq.Workplane("XY").workplane(offset=current_z).circle(r1).extrude(l)
         else:
-            # Конус (Loft)
+            # Конический участок / Фаска
             solid = (
                 cq.Workplane("XY")
                 .workplane(offset=current_z)
@@ -168,7 +169,7 @@ def build_cad_model(spec: dict, filename_base: str):
 
         current_z += l
 
-    # 2. Выполнение внутреннего глухого или сквозного отверстия
+    # 2. Выполнение внутреннего отверстия
     bores = spec.get("bores", [])
     for bore in bores:
         bd = float(bore.get("diameter", 0))
@@ -177,10 +178,8 @@ def build_cad_model(spec: dict, filename_base: str):
 
         if bd > 0 and depth > 0:
             if from_side == "right":
-                # Сверление с правого торца
                 result = result.faces(">Z").workplane().hole(bd, depth)
             else:
-                # Сверление с левого торца
                 result = result.faces("<Z").workplane().hole(bd, depth)
 
     step_path = os.path.join(EXPORTS_DIR, f"{filename_base}.step")
