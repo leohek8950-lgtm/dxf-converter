@@ -21,41 +21,6 @@ async def serve_index():
     except FileNotFoundError:
         return "<h1>Ошибка: файл index.html не найден.</h1>"
 
-def get_active_gemini_model(api_key: str) -> str:
-    """Динамический поиск активной модели Gemini, доступной для данного API ключа"""
-    try:
-        list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        res = requests.get(list_url, timeout=10)
-        if res.status_code == 200:
-            models = res.json().get("models", [])
-            valid_models = [
-                m["name"].replace("models/", "")
-                for m in models
-                if "generateContent" in m.get("supportedGenerationMethods", [])
-            ]
-            
-            # Приоритет лучших моделей
-            preferences = [
-                "gemini-2.5-flash", 
-                "gemini-2.0-flash", 
-                "gemini-1.5-flash", 
-                "gemini-2.5-pro", 
-                "gemini-1.5-pro"
-            ]
-            for pref in preferences:
-                if pref in valid_models:
-                    return pref
-            
-            # Если нет в списке предпочтений, берём первую рабочую
-            gemini_models = [m for m in valid_models if "gemini" in m]
-            if gemini_models:
-                return gemini_models[0]
-    except Exception:
-        pass
-    
-    # Резервный вариант
-    return "gemini-2.0-flash"
-
 def parse_drawing_with_gemini(img_bytes: bytes):
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -64,56 +29,37 @@ def parse_drawing_with_gemini(img_bytes: bytes):
     api_key = re.sub(r'\[.*?\]|\(|\)', '', api_key).strip()
     base64_image = base64.b64encode(img_bytes).decode("utf-8")
 
-    # Автоматически определяем рабочую модель
-    model_name = get_active_gemini_model(api_key)
-
     prompt = """
-    Ты — главный инженер-технолог по ЧПУ. Твоя задача — с ювелирной точностью распознать ВСЕ геометрические элементы детали на чертеже, ВКЛЮЧАЯ ФАСКИ И ПЕРЕХОДЫ.
+    Ты — главный инженер-технолог по ЧПУ. Твоя задача — детально разобрать машиностроительный чертеж детали и сформировать JSON-описание внешней и внутренней геометрии.
 
-    ВНИМАТЕЛЬНО ИЗУЧИ КОНТУР СЛЕВА НАПРАВО:
-    1. Не пропускай ФАСКИ (chamfers) и технологические скосы на торцах и переходах между диаметрами!
-    2. Если между цилиндром и следующим участком есть фаска или уступ, ОБЯЗАТЕЛЬНО внеси её в 'outer_profile' как отдельный короткий конический элемент.
-    3. Для каждого элемента указывай 'start_diameter', 'end_diameter' и 'length'.
+    ВНИМАТЕЛЬНО ИЗУЧИ ЧЕРТЕЖ:
+    1. ВНЕШНИЙ ПРОФИЛЬ (outer_profile):
+       - Разбей геометрию слева направо на последовательные цилиндрические и конические участки/канавки/фаски.
+       - Указывай номинальные размеры без допусков (например, из '18+0.2' бери 18.0, из '22-0.05' бери 22.0).
+       - Обязательно укажи start_diameter, end_diameter и length для каждого участка.
 
-    Пример детали с фасками и конусами:
+    2. ВНУТРЕННИЕ ОТВЕРСТИЯ И РАСТОЧКИ (bores):
+       - Найди ступенчатые отверстия и расточки (разрез A-A).
+       - Укажи диаметр (diameter), глубину (depth) и с какого торца идет расточка (from_side: 'right' или 'left').
+
+    Формат ответа (ТОЛЬКО ЧИСТЫЙ JSON):
     {
-      "part_name": "Деталь с фасками",
-      "total_length": 61.0,
+      "part_name": "Ступенчатая деталь",
+      "total_length": 45.0,
       "outer_profile": [
-        {
-          "type": "cone",
-          "start_diameter": 4.5,
-          "end_diameter": 18.0,
-          "length": 23.5
-        },
-        {
-          "type": "cylinder",
-          "start_diameter": 18.0,
-          "end_diameter": 18.0,
-          "length": 14.5
-        },
-        {
-          "type": "chamfer",
-          "start_diameter": 18.0,
-          "end_diameter": 16.5,
-          "length": 1.5
-        },
-        {
-          "type": "cone",
-          "start_diameter": 16.5,
-          "end_diameter": 16.0,
-          "length": 21.5
-        }
+        {"type": "cylinder", "start_diameter": 18.0, "end_diameter": 18.0, "length": 5.0},
+        {"type": "cylinder", "start_diameter": 24.0, "end_diameter": 24.0, "length": 5.0},
+        {"type": "cylinder", "start_diameter": 22.0, "end_diameter": 22.0, "length": 12.5},
+        {"type": "cylinder", "start_diameter": 35.0, "end_diameter": 35.0, "length": 10.0},
+        {"type": "cylinder", "start_diameter": 36.0, "end_diameter": 36.0, "length": 12.5}
       ],
       "bores": [
-        {
-          "diameter": 8.0,
-          "depth": 26.5,
-          "from_side": "right"
-        }
+        {"diameter": 30.0, "depth": 5.0, "from_side": "right"},
+        {"diameter": 22.0, "depth": 10.0, "from_side": "right"},
+        {"diameter": 20.0, "depth": 11.2, "from_side": "right"}
       ]
     }
-    Строго соблюдай все размеры в миллиметрах (мм)! Верни ТОЛЬКО валидный JSON без внешнего текста.
+    Строго соблюдай все номинальные размеры в миллиметрах!
     """
 
     payload = {
@@ -125,16 +71,33 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         }]
     }
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-    params = {"key": api_key}
+    # Поочередная попытка быстрых и стабильных моделей
+    models_to_try = [
+        ("v1beta", "gemini-1.5-flash"),
+        ("v1beta", "gemini-2.0-flash"),
+        ("v1beta", "gemini-2.5-flash")
+    ]
 
-    try:
-        res = requests.post(url, params=params, json=payload, timeout=30)
-        if res.status_code != 200:
-            raise ValueError(f"HTTP {res.status_code}: {res.text}")
-        res_data = res.json()
-    except Exception as e:
-        raise ValueError(f"Ошибка обращения к ИИ ({model_name}): {e}")
+    res_data = None
+    last_error = None
+
+    for api_ver, model_name in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model_name}:generateContent"
+        params = {"key": api_key}
+        
+        try:
+            # Таймаут увеличен до 90 секунд
+            res = requests.post(url, params=params, json=payload, timeout=90)
+            if res.status_code == 200:
+                res_data = res.json()
+                break
+            else:
+                last_error = f"HTTP {res.status_code}: {res.text}"
+        except Exception as e:
+            last_error = str(e)
+
+    if not res_data:
+        raise ValueError(f"Ошибка обращения к ИИ: {last_error}")
 
     try:
         text_content = res_data['candidates'][0]['content']['parts'][0]['text']
@@ -148,15 +111,15 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         raise ValueError(f"Ошибка парсинга ответа ИИ: {parse_err}")
 
 def build_cad_model(spec: dict, filename_base: str):
-    """Генерация точной CAD-модели с учетом всех фасок, конусов и отверстий"""
+    """Генерация CAD-модели в CadQuery с поддержкой ступенчатых валов и расточек"""
     profile = spec.get("outer_profile", [])
     if not profile:
-        raise ValueError("В ответе ИИ не найден профиль детали.")
+        raise ValueError("В ответе ИИ не найден внешний профиль детали.")
 
     current_z = 0.0
     result = None
 
-    # 1. Построение внешних ступеней, фасок и конусов
+    # 1. Построение внешнего контура
     for seg in profile:
         d1 = float(seg.get("start_diameter", 10.0))
         d2 = float(seg.get("end_diameter", 10.0))
@@ -187,9 +150,12 @@ def build_cad_model(spec: dict, filename_base: str):
 
         current_z += l
 
-    # 2. Выполнение внутреннего отверстия
+    # 2. Выполнение ступенчатых отверстий и расточек
     bores = spec.get("bores", [])
-    for bore in bores:
+    # Сортируем отверстия от наибольшего диаметра к наименьшему для правильного формирования расточек
+    bores_sorted = sorted(bores, key=lambda x: float(x.get("diameter", 0)), reverse=True)
+
+    for bore in bores_sorted:
         bd = float(bore.get("diameter", 0))
         depth = float(bore.get("depth", 0))
         from_side = bore.get("from_side", "right")
