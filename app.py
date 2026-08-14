@@ -22,15 +22,15 @@ async def serve_index():
     except FileNotFoundError:
         return "<h1>Ошибка: файл index.html не найден.</h1>"
 
-def compress_image_bytes(img_bytes: bytes, max_dim=800) -> bytes:
-    """Уменьшает разрешение изображения для мгновенного отклика API (3-5 сек)"""
+def compress_image_bytes(img_bytes: bytes, max_dim=1024) -> bytes:
+    """Сжатие чертежа для ускорения передачи в API"""
     try:
         img = Image.open(io.BytesIO(img_bytes))
         img.thumbnail((max_dim, max_dim))
         buf = io.BytesIO()
         if img.mode != 'RGB':
             img = img.convert('RGB')
-        img.save(buf, format='JPEG', quality=80)
+        img.save(buf, format='JPEG', quality=85)
         return buf.getvalue()
     except Exception:
         return img_bytes
@@ -41,21 +41,19 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         raise ValueError("GEMINI_API_KEY не установлен!")
 
     api_key = re.sub(r'\[.*?\]|\(|\)', '', api_key).strip()
-    
-    # Сжимаем изображение для супер-быстрой обработки
     small_bytes = compress_image_bytes(img_bytes)
     base64_image = base64.b64encode(small_bytes).decode("utf-8")
 
-    # Лаконичный, но строгий промпт с вычислением размерных цепей
     prompt = """
     Ты — инженер-конструктор ЧПУ. Оцифруй чертеж детали в JSON.
 
-    АЛГОРИТМ РАСЧЕТА РАЗМЕРОВ:
-    1. Сравни главный вид и разрез А-А. Найди ВСЕ канавки, фаски, пазы и ступенчатые расточки.
-    2. Вычисли недостающие размеры: если длина паза/элемента не проставлена напрямую, ВЫЧИСЛИ её через разность цепочки длин: L_элемента = L_общее - Sum(L_остальные).
-    3. Использовать ТОЛЬКО номинальные размеры (без допусков ±).
+    АЛГОРИТМ РАСЧЕТА И СРАВНЕНИЯ ГЕОМЕТРИИ:
+    1. ВИЗУАЛЬНЫЙ АУДИТ: Сравни внешний вид и разрез (A-A). Найди ВСЕ канавки, фаски, пазы и ступенчатые расточки.
+    2. ВЫЧИСЛЕНИЕ РАЗМЕРНЫХ ЦЕПЕЙ: Если длина паза/уступа не проставлена напрямую, ВЫЧИСЛИ её: 
+       L_паза = L_общее - Sum(L_остальных_известных_сегментов).
+    3. Используй ТОЛЬКО номинальные размеры (без допусков ±).
 
-    Верни ТОЛЬКО валидный JSON без markdown:
+    Верни ТОЛЬКО валидный JSON без разметки markdown:
     {
       "part_name": "Деталь",
       "total_length": 45.0,
@@ -88,11 +86,11 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         }
     }
 
-    # Модели в порядке приоритета скорости
+    # Валидные имена моделей в Google AI Studio REST API
     models_to_try = [
         ("v1beta", "gemini-2.5-flash"),
         ("v1beta", "gemini-2.0-flash"),
-        ("v1beta", "gemini-1.5-flash")
+        ("v1beta", "gemini-1.5-flash-latest")
     ]
 
     last_err = None
@@ -100,8 +98,8 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model_name}:generateContent"
         params = {"key": api_key}
         try:
-            # Корректный таймаут 18 секунд на одну модель (если зависла — сразу переходим к следующей)
-            res = requests.post(url, params=params, json=payload, timeout=18)
+            # Увеличенный таймаут до 60 секунд
+            res = requests.post(url, params=params, json=payload, timeout=60)
             if res.status_code == 200:
                 res_data = res.json()
                 text_content = res_data['candidates'][0]['content']['parts'][0]['text']
@@ -111,7 +109,7 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         except Exception as e:
             last_err = f"[{model_name}] {str(e)}"
 
-    raise ValueError(f"Не удалось получить ответ от ИИ: {last_err}")
+    raise ValueError(f"Ошибка ИИ: {last_err}")
 
 def build_cad_model(spec: dict, filename_base: str):
     profile = spec.get("outer_profile", [])
@@ -121,7 +119,7 @@ def build_cad_model(spec: dict, filename_base: str):
     current_z = 0.0
     result = None
 
-    # 1. Построение наружного контура
+    # 1. Наружный профиль
     for seg in profile:
         d1 = float(seg.get("start_diameter", 10.0))
         d2 = float(seg.get("end_diameter", 10.0))
@@ -152,7 +150,7 @@ def build_cad_model(spec: dict, filename_base: str):
 
         current_z += l
 
-    # 2. Выполнение внутренних ступенчатых расточек и отверстий
+    # 2. Внутренние расточки
     bores = spec.get("bores", [])
     bores_sorted = sorted(bores, key=lambda x: float(x.get("diameter", 0)), reverse=True)
 
