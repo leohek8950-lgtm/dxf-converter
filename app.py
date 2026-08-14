@@ -22,15 +22,15 @@ async def serve_index():
     except FileNotFoundError:
         return "<h1>Ошибка: файл index.html не найден.</h1>"
 
-def compress_image_bytes(img_bytes: bytes, max_dim=1200) -> bytes:
-    """Оптимизация чертежа для мгновенной передачи в ИИ"""
+def compress_image_bytes(img_bytes: bytes, max_dim=800) -> bytes:
+    """Уменьшает разрешение изображения для мгновенного отклика API (3-5 сек)"""
     try:
         img = Image.open(io.BytesIO(img_bytes))
         img.thumbnail((max_dim, max_dim))
         buf = io.BytesIO()
         if img.mode != 'RGB':
             img = img.convert('RGB')
-        img.save(buf, format='JPEG', quality=90)
+        img.save(buf, format='JPEG', quality=80)
         return buf.getvalue()
     except Exception:
         return img_bytes
@@ -41,28 +41,21 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         raise ValueError("GEMINI_API_KEY не установлен!")
 
     api_key = re.sub(r'\[.*?\]|\(|\)', '', api_key).strip()
-    small_img_bytes = compress_image_bytes(img_bytes)
-    base64_image = base64.b64encode(small_img_bytes).decode("utf-8")
+    
+    # Сжимаем изображение для супер-быстрой обработки
+    small_bytes = compress_image_bytes(img_bytes)
+    base64_image = base64.b64encode(small_bytes).decode("utf-8")
 
+    # Лаконичный, но строгий промпт с вычислением размерных цепей
     prompt = """
-    Ты — эксперт-технолог по ЧПУ и CAD-проектированию.
-    Проведи визуальный и размерный анализ машиностроительного чертежа.
+    Ты — инженер-конструктор ЧПУ. Оцифруй чертеж детали в JSON.
 
-    ИНСТРУКЦИЯ ПО ВЫЧИСЛЕНИЮ И СРАВНЕНИЮ РАЗМЕРОВ:
-    1. ВИЗУАЛЬНЫЙ АУДИТ: 
-       - Сопоставь внешний вид и разрез (A-A). Найди ВСЕ канавки, проточки, фаски и уступы.
-       - Не пропусти канавку (например, канавку под выгрузку/уплотнение на диаметрах) и внутренние ступенчатые выточки.
+    АЛГОРИТМ РАСЧЕТА РАЗМЕРОВ:
+    1. Сравни главный вид и разрез А-А. Найди ВСЕ канавки, фаски, пазы и ступенчатые расточки.
+    2. Вычисли недостающие размеры: если длина паза/элемента не проставлена напрямую, ВЫЧИСЛИ её через разность цепочки длин: L_элемента = L_общее - Sum(L_остальные).
+    3. Использовать ТОЛЬКО номинальные размеры (без допусков ±).
 
-    2. ВЫЧИСЛЕНИЕ НЕДОСТАЮЩИХ РАЗМЕРОВ (Цепочка размеров):
-       - Если длина какого-то элемента (например, паза или уступа) не проставлена напрямую, ВЫЧИСЛИ ЕЁ через размерную цепь:
-         Длина_элемента = Габаритная_длина - Сумма(Остальных_известных_длин).
-       - Учитывай номинальные значения размеров (без допусков ±).
-
-    3. ФОРМИРОВАНИЕ ГЕОМЕТРИИ (слева направо):
-       - 'outer_profile': массив последовательных участков (cylinder, cone, chamfer, groove).
-       - 'bores': массив всех внутренних расточек и отверстий с указанием 'diameter', 'depth' и стороны 'from_side' ('right' или 'left').
-
-    Верни ТОЛЬКО валидный JSON без разметки markdown:
+    Верни ТОЛЬКО валидный JSON без markdown:
     {
       "part_name": "Деталь",
       "total_length": 45.0,
@@ -90,14 +83,16 @@ def parse_drawing_with_gemini(img_bytes: bytes):
             ]
         }],
         "generationConfig": {
-            "responseMimeType": "application/json"
+            "responseMimeType": "application/json",
+            "temperature": 0.1
         }
     }
 
+    # Модели в порядке приоритета скорости
     models_to_try = [
+        ("v1beta", "gemini-2.5-flash"),
         ("v1beta", "gemini-2.0-flash"),
-        ("v1beta", "gemini-1.5-flash"),
-        ("v1beta", "gemini-2.5-flash")
+        ("v1beta", "gemini-1.5-flash")
     ]
 
     last_err = None
@@ -105,27 +100,28 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model_name}:generateContent"
         params = {"key": api_key}
         try:
-            res = requests.post(url, params=params, json=payload, timeout=50)
+            # Корректный таймаут 18 секунд на одну модель (если зависла — сразу переходим к следующей)
+            res = requests.post(url, params=params, json=payload, timeout=18)
             if res.status_code == 200:
                 res_data = res.json()
                 text_content = res_data['candidates'][0]['content']['parts'][0]['text']
                 return json.loads(text_content.strip())
             else:
-                last_err = f"HTTP {res.status_code}: {res.text}"
+                last_err = f"[{model_name}] HTTP {res.status_code}: {res.text}"
         except Exception as e:
-            last_err = str(e)
+            last_err = f"[{model_name}] {str(e)}"
 
-    raise ValueError(f"Ошибка обращения к ИИ: {last_err}")
+    raise ValueError(f"Не удалось получить ответ от ИИ: {last_err}")
 
 def build_cad_model(spec: dict, filename_base: str):
     profile = spec.get("outer_profile", [])
     if not profile:
-        raise ValueError("Не найден внешний профиль детали.")
+        raise ValueError("В ответе ИИ отсутствует внешний профиль детали.")
 
     current_z = 0.0
     result = None
 
-    # 1. Построение внешнего контура
+    # 1. Построение наружного контура
     for seg in profile:
         d1 = float(seg.get("start_diameter", 10.0))
         d2 = float(seg.get("end_diameter", 10.0))
@@ -156,7 +152,7 @@ def build_cad_model(spec: dict, filename_base: str):
 
         current_z += l
 
-    # 2. Построение внутренних расточек
+    # 2. Выполнение внутренних ступенчатых расточек и отверстий
     bores = spec.get("bores", [])
     bores_sorted = sorted(bores, key=lambda x: float(x.get("diameter", 0)), reverse=True)
 
@@ -183,7 +179,6 @@ def build_cad_model(spec: dict, filename_base: str):
 async def analyze_file(file: UploadFile = File(...)):
     contents = await file.read()
     
-    # Корректная очистка имени файла
     clean_name = re.sub(r'[^a-zA-Z0-9]', '', os.path.splitext(file.filename)[0])
     if not clean_name:
         clean_name = "cad_model"
