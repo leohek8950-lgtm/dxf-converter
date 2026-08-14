@@ -1,225 +1,186 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI CAD Converter - 3D Visualizer</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { margin: 0; font-family: 'Segoe UI', Arial, sans-serif; background-color: #f4f6f9; display: flex; height: 100vh; overflow: hidden; }
-        .sidebar { width: 380px; min-width: 320px; background: #ffffff; box-shadow: 2px 0 10px rgba(0,0,0,0.1); padding: 20px; display: flex; flex-direction: column; gap: 15px; z-index: 10; }
-        h2 { margin-top: 0; color: #1e293b; font-size: 20px; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }
-        label { font-size: 13px; font-weight: bold; color: #475569; display: block; margin-bottom: 5px; }
-        select, input[type="file"], button { width: 100%; padding: 10px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 14px; outline: none; }
-        select:focus, input[type="file"]:focus { border-color: #3b82f6; }
-        button { background-color: #10b981; color: white; border: none; cursor: pointer; font-weight: bold; transition: background 0.2s; }
-        button:hover { background-color: #059669; }
-        .result-box { background: #0f172a; color: #38bdf8; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 11px; white-space: pre-wrap; max-height: 250px; overflow-y: auto; flex-grow: 1; border: 1px solid #1e293b; }
-        #canvas-container { flex-grow: 1; background: #090d16; position: relative; }
-        .info-panel { font-size: 12px; color: #475569; background: #f1f5f9; border-left: 4px solid #3b82f6; padding: 8px 12px; border-radius: 4px; }
-    </style>
-    <!-- Three.js и OrbitControls -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Precision AI CAD Engine - Токарная и ЧПУ обработка</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --panel: #151b2c;
+      --accent: #00f2fe;
+      --accent-hover: #4facfe;
+      --text: #e2e8f0;
+      --border: #232d45;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
+    body { background-color: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; }
+    
+    /* Сайдбар управления */
+    .sidebar { width: 420px; background: var(--panel); border-right: 1px solid var(--border); padding: 24px; display: flex; flex-direction: column; gap: 20px; z-index: 10; }
+    .logo { font-size: 20px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 10px; }
+    .logo span { color: var(--accent); }
+    
+    .upload-box { border: 2px dashed var(--border); border-radius: 12px; padding: 30px 20px; text-align: center; cursor: pointer; transition: 0.3s; }
+    .upload-box:hover { border-color: var(--accent); background: rgba(0, 242, 254, 0.03); }
+    .upload-box input { display: none; }
+    
+    .btn { background: linear-gradient(135deg, var(--accent), var(--accent-hover)); border: none; color: #000; font-weight: 700; padding: 14px; border-radius: 8px; cursor: pointer; transition: 0.2s; font-size: 15px; }
+    .btn:hover { opacity: 0.9; transform: translateY(-1px); }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    
+    .btn-download { background: #22c55e; color: #fff; text-decoration: none; text-align: center; display: none; padding: 14px; border-radius: 8px; font-weight: 700; }
+    
+    .spec-panel { background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px; padding: 15px; flex-grow: 1; overflow-y: auto; font-family: monospace; font-size: 13px; line-height: 1.5; color: #a0aec0; }
+
+    /* Окно 3D Просмотра */
+    .viewport { flex-grow: 1; position: relative; background: radial-gradient(circle at center, #1a233a 0%, #0b0f19 100%); }
+    #canvas-container { width: 100%; height: 100%; }
+    
+    .status-overlay { position: absolute; top: 20px; left: 20px; background: rgba(21, 27, 44, 0.8); backdrop-filter: blur(10px); border: 1px solid var(--border); padding: 12px 20px; border-radius: 30px; font-size: 14px; font-weight: 600; color: var(--accent); }
+  </style>
 </head>
 <body>
 
-    <div class="sidebar">
-        <h2>Конвертер чертежей в ЧПУ</h2>
-        
-        <div>
-            <label for="processType">Тип 3D-моделирования:</label>
-            <select id="processType">
-                <option value="lathe" selected>Токарная деталь -> 3D Revolve</option>
-                <option value="extrude">Плоская деталь -> 3D Extrude</option>
-                <option value="wireframe">Векторный контур -> Сетка</option>
-            </select>
-        </div>
-
-        <div>
-            <label for="dxfFile">Загрузить чертеж (DXF, PNG, JPG):</label>
-            <input type="file" id="dxfFile" accept=".dxf,.png,.jpg,.jpeg">
-        </div>
-
-        <button onclick="uploadAndProcess()">Сгенерировать 3D</button>
-
-        <div class="info-panel">
-            <strong>Обработка чертежа:</strong> Для режим токарной детали сканируется профиль относительно центральной оси вращения.
-        </div>
-
-        <div>
-            <label>Статус обработки:</label>
-            <div id="resultOutput" class="result-box">Ожидание загрузки файла...</div>
-        </div>
+  <div class="sidebar">
+    <div class="logo">📐 Precision <span>AI CAD</span></div>
+    
+    <div class="upload-box" onclick="document.getElementById('file-input').click()">
+      <div id="upload-text">📁 Перетащите чертеж или нажмите для выбора (JPG, PNG, PDF)</div>
+      <input type="file" id="file-input" accept="image/*" onchange="handleFile(this.files[0])">
     </div>
 
+    <button id="process-btn" class="btn" disabled onclick="processDrawing()">Сгенерировать STEP модель</button>
+    
+    <a id="download-btn" class="btn-download" href="#" download>📥 Скачать STEP модель (.step)</a>
+
+    <div class="spec-panel" id="spec-output">
+      // Спецификация распознанных размеров отобразится здесь...
+    </div>
+  </div>
+
+  <div class="viewport">
+    <div class="status-overlay" id="status">Готов к загрузке чертежа</div>
     <div id="canvas-container"></div>
+  </div>
 
-    <script>
-        let scene, camera, renderer, controls, gridHelper;
-        let currentContours = [];
+  <script>
+    let selectedFile = null;
+    let scene, camera, renderer, controls, currentMesh;
 
-        function initThree() {
-            const container = document.getElementById('canvas-container');
-            container.innerHTML = '';
+    // Инициализация Three.js 3D Viewport
+    function init3D() {
+      const container = document.getElementById('canvas-container');
+      scene = new THREE.Scene();
+      
+      camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
+      camera.position.set(100, 100, 150);
 
-            scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x090d16);
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      renderer.setPixelRatio(window.devicePixelRatio);
+      container.appendChild(renderer.domElement);
 
-            camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 1, 100000);
-            camera.position.set(0, 100, 250);
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
 
-            renderer = new THREE.WebGLRenderer({ antialias: true });
-            renderer.setSize(container.clientWidth, container.clientHeight);
-            renderer.shadowMap.enabled = true;
-            container.appendChild(renderer.domElement);
+      // Освещение
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+      scene.add(ambientLight);
 
-            // Освещение для токарных металлической деталей
-            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
-            scene.add(ambientLight);
+      const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
+      dirLight1.position.set(1, 1, 1);
+      scene.add(dirLight1);
 
-            const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
-            dirLight1.position.set(200, 400, 200);
-            scene.add(dirLight1);
+      const dirLight2 = new THREE.DirectionalLight(0x00f2fe, 0.5);
+      dirLight2.position.set(-1, -1, -1);
+      scene.add(dirLight2);
 
-            const dirLight2 = new THREE.DirectionalLight(0x38bdf8, 0.4);
-            dirLight2.position.set(-200, -200, -200);
-            scene.add(dirLight2);
+      // Сетка
+      const grid = new THREE.GridHelper(300, 30, 0x232d45, 0x151b2c);
+      grid.position.y = -20;
+      scene.add(grid);
 
-            controls = new THREE.OrbitControls(camera, renderer.domElement);
-            controls.enableDamping = true;
+      window.addEventListener('resize', onWindowResize);
+      animate();
+    }
 
-            gridHelper = new THREE.GridHelper(1000, 40, 0x1e293b, 0x0f172a);
-            scene.add(gridHelper);
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
 
-            window.addEventListener('resize', onWindowResize);
-            document.getElementById('processType').addEventListener('change', () => renderGeometry(currentContours));
-            animate();
-        }
+    function onWindowResize() {
+      const container = document.getElementById('canvas-container');
+      camera.aspect = container.clientWidth / container.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    }
 
-        function animate() {
-            requestAnimationFrame(animate);
-            controls.update();
-            renderer.render(scene, camera);
-        }
+    function handleFile(file) {
+      if (!file) return;
+      selectedFile = file;
+      document.getElementById('upload-text').innerText = `📄 Выбран: ${file.name}`;
+      document.getElementById('process-btn').disabled = false;
+    }
 
-        function onWindowResize() {
-            const container = document.getElementById('canvas-container');
-            camera.aspect = container.clientWidth / container.clientHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(container.clientWidth, container.clientHeight);
-        }
+    async function processDrawing() {
+      if (!selectedFile) return;
 
-        async function uploadAndProcess() {
-            const fileInput = document.getElementById('dxfFile');
-            const outputBox = document.getElementById('resultOutput');
+      const status = document.getElementById('status');
+      const specBox = document.getElementById('spec-output');
+      const downloadBtn = document.getElementById('download-btn');
+      
+      status.innerText = "⏳ ИИ распознает чертеж и строит CAD модель...";
+      downloadBtn.style.display = "none";
 
-            if (fileInput.files.length === 0) {
-                alert('Выберите файл чертежа!');
-                return;
-            }
+      const formData = new FormData();
+      formData.append("file", selectedFile);
 
-            const formData = new FormData();
-            formData.append('file', fileInput.files[0]);
+      try {
+        const response = await fetch("/api/analyze", { method: "POST", body: formData });
+        const data = await response.json();
 
-            outputBox.textContent = 'Обработка чертежа и сканирование профиля...';
+        if (!response.ok) throw new Error(data.detail || "Ошибка обработки");
 
-            try {
-                const response = await fetch('/process-dxf', { method: 'POST', body: formData });
-                const data = await response.json();
+        status.innerText = "✅ 3D Модель успешно построена!";
+        specBox.innerText = JSON.stringify(data.spec, null, 2);
 
-                if (!response.ok) throw new Error(data.detail || 'Ошибка сервера');
+        // Настройка кнопки скачивания STEP
+        downloadBtn.href = data.step_url;
+        downloadBtn.style.display = "block";
 
-                outputBox.textContent = JSON.stringify(data, null, 2);
-                currentContours = data.contours;
-                renderGeometry(currentContours);
+        // Загрузка STL для отображения в Three.js
+        loadSTL(data.stl_url);
 
-            } catch (err) {
-                outputBox.textContent = 'Ошибка: ' + err.message;
-            }
-        }
+      } catch (err) {
+        status.innerText = "❌ Ошибка: " + err.message;
+      }
+    }
 
-        function renderGeometry(contours) {
-            const oldGroup = scene.getObjectByName('dxfGroup');
-            if (oldGroup) scene.remove(oldGroup);
+    function loadSTL(url) {
+      const loader = new THREE.STLLoader();
+      loader.load(url, function (geometry) {
+        if (currentMesh) scene.remove(currentMesh);
 
-            if (!contours || contours.length === 0) return;
+        const material = new THREE.MeshStandardMaterial({
+          color: 0x90a4ae,
+          roughness: 0.3,
+          metalness: 0.8
+        });
 
-            const mode = document.getElementById('processType').value;
-            const group = new THREE.Group();
-            group.name = 'dxfGroup';
+        currentMesh = new THREE.Mesh(geometry, material);
+        geometry.center();
+        scene.add(currentMesh);
+      });
+    }
 
-            // Реалистичный материал обработки металла (токарный станок)
-            const metalMaterial = new THREE.MeshStandardMaterial({
-                color: 0x94a3b8,
-                metalness: 0.85,
-                roughness: 0.25,
-                side: THREE.DoubleSide
-            });
-
-            if (mode === 'lathe') {
-                let ptsSource = contours[0];
-                if (ptsSource && ptsSource.length > 1) {
-                    const profilePoints = [];
-                    ptsSource.forEach(p => {
-                        // Vector2(Радиус детали, Положение вдоль оси)
-                        profilePoints.push(new THREE.Vector2(Math.max(0.001, p.y), p.x));
-                    });
-
-                    const latheGeo = new THREE.LatheGeometry(profilePoints, 64);
-                    const latheMesh = new THREE.Mesh(latheGeo, metalMaterial);
-                    
-                    // Поворот детали горизонтально вдоль оси X
-                    latheMesh.rotation.z = -Math.PI / 2;
-                    group.add(latheMesh);
-                }
-            } else if (mode === 'extrude') {
-                contours.forEach(pts => {
-                    if (pts.length < 3) return;
-                    const shape = new THREE.Shape();
-                    shape.moveTo(pts[0].x, pts[0].y);
-                    for (let i = 1; i < pts.length; i++) {
-                        shape.lineTo(pts[i].x, pts[i].y);
-                    }
-                    shape.closePath();
-
-                    const extrudeSettings = { depth: 15, bevelEnabled: true, bevelThickness: 1, bevelSize: 1 };
-                    const geo = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-                    const mesh = new THREE.Mesh(geo, metalMaterial);
-                    mesh.rotation.x = -Math.PI / 2;
-                    group.add(mesh);
-                });
-            } else {
-                const lineMaterial = new THREE.LineBasicMaterial({ color: 0x38bdf8, linewidth: 2 });
-                contours.forEach(pts => {
-                    const linePositions = [];
-                    for (let i = 0; i < pts.length; i++) {
-                        const next = pts[(i + 1) % pts.length];
-                        linePositions.push(pts[i].x, pts[i].y, 0, next.x, next.y, 0);
-                    }
-                    const geometry = new THREE.BufferGeometry();
-                    geometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
-                    const lines = new THREE.LineSegments(geometry, lineMaterial);
-                    lines.rotation.x = -Math.PI / 2;
-                    group.add(lines);
-                });
-            }
-
-            // Автоматическое центрирование и фокусировка камеры на детали
-            const box = new THREE.Box3().setFromObject(group);
-            const center = box.getCenter(new THREE.Vector3());
-            const size = box.getSize(new THREE.Vector3());
-
-            group.position.sub(center);
-            scene.add(group);
-
-            const maxDim = Math.max(size.x, size.y, size.z);
-            const camDistance = Math.max(maxDim * 2.2, 80);
-            camera.position.set(0, camDistance * 0.6, camDistance);
-            camera.lookAt(0, 0, 0);
-        }
-
-        window.onload = initThree;
-    </script>
+    init3D();
+  </script>
 </body>
 </html>
