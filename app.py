@@ -21,6 +21,41 @@ async def serve_index():
     except FileNotFoundError:
         return "<h1>Ошибка: файл index.html не найден.</h1>"
 
+def get_active_gemini_model(api_key: str) -> str:
+    """Динамический поиск активной модели Gemini, доступной для данного API ключа"""
+    try:
+        list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        res = requests.get(list_url, timeout=10)
+        if res.status_code == 200:
+            models = res.json().get("models", [])
+            valid_models = [
+                m["name"].replace("models/", "")
+                for m in models
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+            ]
+            
+            # Приоритет лучших моделей
+            preferences = [
+                "gemini-2.5-flash", 
+                "gemini-2.0-flash", 
+                "gemini-1.5-flash", 
+                "gemini-2.5-pro", 
+                "gemini-1.5-pro"
+            ]
+            for pref in preferences:
+                if pref in valid_models:
+                    return pref
+            
+            # Если нет в списке предпочтений, берём первую рабочую
+            gemini_models = [m for m in valid_models if "gemini" in m]
+            if gemini_models:
+                return gemini_models[0]
+    except Exception:
+        pass
+    
+    # Резервный вариант
+    return "gemini-2.0-flash"
+
 def parse_drawing_with_gemini(img_bytes: bytes):
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -29,7 +64,9 @@ def parse_drawing_with_gemini(img_bytes: bytes):
     api_key = re.sub(r'\[.*?\]|\(|\)', '', api_key).strip()
     base64_image = base64.b64encode(img_bytes).decode("utf-8")
 
-    # ОБНОВЛЕННЫЙ ПРОМПТ С УЧЕТОМ ФАСОК И УСТУПОВ
+    # Автоматически определяем рабочую модель
+    model_name = get_active_gemini_model(api_key)
+
     prompt = """
     Ты — главный инженер-технолог по ЧПУ. Твоя задача — с ювелирной точностью распознать ВСЕ геометрические элементы детали на чертеже, ВКЛЮЧАЯ ФАСКИ И ПЕРЕХОДЫ.
 
@@ -88,33 +125,16 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         }]
     }
 
-    models_to_try = [
-        ("v1beta", "gemini-2.5-flash"),
-        ("v1", "gemini-1.5-flash"),
-        ("v1beta", "gemini-2.0-flash"),
-        ("v1beta", "gemini-1.5-flash"),
-        ("v1beta", "gemini-1.5-pro")
-    ]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+    params = {"key": api_key}
 
-    res_data = None
-    last_error = None
-
-    for api_ver, model_name in models_to_try:
-        url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model_name}:generateContent"
-        params = {"key": api_key}
-        
-        try:
-            res = requests.post(url, params=params, json=payload, timeout=25)
-            if res.status_code == 200:
-                res_data = res.json()
-                break
-            else:
-                last_error = f"HTTP {res.status_code}: {res.text}"
-        except Exception as e:
-            last_error = str(e)
-
-    if not res_data:
-        raise ValueError(f"Ошибка ИИ: {last_error}")
+    try:
+        res = requests.post(url, params=params, json=payload, timeout=30)
+        if res.status_code != 200:
+            raise ValueError(f"HTTP {res.status_code}: {res.text}")
+        res_data = res.json()
+    except Exception as e:
+        raise ValueError(f"Ошибка обращения к ИИ ({model_name}): {e}")
 
     try:
         text_content = res_data['candidates'][0]['content']['parts'][0]['text']
@@ -149,10 +169,8 @@ def build_cad_model(spec: dict, filename_base: str):
         r2 = d2 / 2.0
 
         if abs(r1 - r2) < 0.001:
-            # Цилиндрический участок
             solid = cq.Workplane("XY").workplane(offset=current_z).circle(r1).extrude(l)
         else:
-            # Конический участок / Фаска
             solid = (
                 cq.Workplane("XY")
                 .workplane(offset=current_z)
