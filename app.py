@@ -2,25 +2,24 @@ import os
 import io
 import json
 import re
-import math
 import base64
 import requests
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import HTMLResponse
-import ezdxf
-import ezdxf.recover
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+import cadquery as cq
 
-app = FastAPI(title="AI CAD Converter - Dynamic Engine")
+app = FastAPI(title="AI Precision CAD Engine")
+
+# Создаем папку для экспорта файлов
+os.makedirs("exports", exist_ok=True)
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_frontend():
-    try:
-        with open("index.html", "r", encoding="utf-8") as f:
-            return f.read()
-    except FileNotFoundError:
-        return "<h1>Ошибка: файл index.html не найден.</h1>"
+async def serve_index():
+    with open("index.html", "r", encoding="utf-8") as f:
+        return f.read()
 
-def analyze_drawing_with_gemini(img_bytes: bytes):
+def parse_drawing_with_gemini(img_bytes: bytes):
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY не установлен в Environment Variables!")
@@ -28,163 +27,111 @@ def analyze_drawing_with_gemini(img_bytes: bytes):
     base64_image = base64.b64encode(img_bytes).decode("utf-8")
 
     prompt = """
-    Ты — инженер-конструктор и эксперт по распознаванию чертежей токарных деталей.
-    Проанализируй чертеж детали вращения:
-    1. ПОЛНОСТЬЮ ИГНОРИРУЙ все выносные линии, размерные стрелки, допуски, тексты, рамку и штамп чертежа.
-    2. Определи центральную ось вращения детали.
-    3. Найди верхний контур металлической детали (радиусный профиль) от левого до правого края.
-    4. Сформируй координаты ступеней/переходов детали слева направо.
+    Ты — главный инженер-технолог по ЧПУ и эксперт по чтению чертежей ISO/ГОСТ.
+    Проанализируй чертеж и извлеки ПОЛНУЮ точную геометрию детали.
     
-    Верни ТОЛЬКО чистый JSON-массив без markdown-тегов и текста в формате:
-    [
-      {"x": 0, "y": 15},
-      {"x": 20, "y": 15},
-      {"x": 20, "y": 25},
-      {"x": 60, "y": 25}
-    ]
-    где 'x' — координата по длине (растет от 0), а 'y' — радиус детали относительно оси.
-    Передай от 20 до 60 ключевых точек ступеней контура.
+    Верни ТОЛЬКО валидный JSON со строгой структурой:
+    {
+      "part_name": "Деталь",
+      "type": "revolve",  // "revolve" для токарных деталей или "extrude" для корпусных
+      "axis_steps": [     // Для деталей вращения: слева направо ступенчато
+        {"diameter": 50.0, "length": 30.0},
+        {"diameter": 35.0, "length": 40.0},
+        {"diameter": 20.0, "length": 20.0}
+      ],
+      "inner_bore": {     // Центральное отверстие (если есть)
+        "diameter": 16.0,
+        "through": true
+      },
+      "chamfers": [      // Фаски
+        {"size": 1.5, "location": "front_outer"},
+        {"size": 1.0, "location": "back_outer"}
+      ]
+    }
+    Строго соблюдай все числовые размеры с чертежа в миллиметрах (мм). Не выдумывай размеры.
     """
 
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
     payload = {
         "contents": [{
             "parts": [
                 {"text": prompt},
-                {
-                    "inline_data": {
-                        "mime_type": "image/jpeg",
-                        "data": base64_image
-                    }
-                }
+                {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}}
             ]
         }]
     }
 
-    # 1. Запрашиваем список всех доступных моделей для вашего ключа
-    models_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-    available_models = []
+    res = requests.post(url, json=payload, timeout=25)
+    if res.status_code != 200:
+        raise ValueError(f"Ошибка ИИ: {res.status_code} - {res.text}")
+
+    res_data = res.json()
+    text_content = res_data['candidates'][0]['content']['parts'][0]['text']
+    clean_json = re.sub(r'```json\s*|\s*```', '', text_content).strip()
+
+    return json.loads(clean_json)
+
+def build_cad_model(spec: dict, filename_base: str):
+    """Генерация точной CAD-модели с помощью CadQuery (OpenCASCADE)"""
     
-    try:
-        m_res = requests.get(models_url, timeout=10)
-        if m_res.status_code == 200:
-            models_data = m_res.json().get("models", [])
-            for m in models_data:
-                # Отбираем модели, поддерживающие generateContent
-                if "generateContent" in m.get("supportedGenerationMethods", []):
-                    # m['name'] имеет вид 'models/gemini-1.5-flash'
-                    available_models.append(m['name'])
-    except Exception as e:
-        print(f"Не удалось получить список моделей: {e}")
+    # 1. Построение детали вращения
+    steps = spec.get("axis_steps", [])
+    if not steps:
+        raise ValueError("Не найдены ступенчатые элементы детали.")
 
-    # Запасной список на случай, если запрос списка моделей не прошёл
-    if not available_models:
-        available_models = [
-            "models/gemini-1.5-flash",
-            "models/gemini-1.5-pro",
-            "models/gemini-2.0-flash",
-            "models/gemini-1.0-pro-vision-latest"
-        ]
+    # Строим профиль
+    current_z = 0.0
+    result = None
 
-    response_text = None
-    last_error = None
-
-    # 2. Пробуем отправить запрос к доступным моделям
-    for model_path in available_models:
-        # Игнорируем модели, не предназначенные для обработки изображений/генерации текста
-        if "embedding" in model_path or "aqa" in model_path:
-            continue
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={api_key}"
-        try:
-            res = requests.post(url, json=payload, timeout=30)
-            if res.status_code == 200:
-                res_data = res.json()
-                candidates = res_data.get('candidates', [])
-                if candidates and 'content' in candidates[0]:
-                    response_text = candidates[0]['content']['parts'][0]['text']
-                    break
-            else:
-                last_error = f"[{model_path}] HTTP {res.status_code}: {res.text}"
-        except Exception as e:
-            last_error = str(e)
-
-    if not response_text:
-        raise ValueError(f"Ошибка вызова Gemini REST API: {last_error}")
-
-    # Очистка JSON от оформления markdown
-    clean_json = re.sub(r'```json\s*|\s*```', '', response_text).strip()
-
-    try:
-        profile = json.loads(clean_json)
-        return profile
-    except Exception:
-        raise ValueError("ИИ вернул ответ в неверном формате JSON.")
-
-def process_dxf_file(contents: bytes):
-    try:
-        doc, auditor = ezdxf.recover.read(io.BytesIO(contents))
-    except Exception:
-        text_data = contents.decode('utf-8', errors='ignore')
-        doc, auditor = ezdxf.recover.read(io.StringIO(text_data))
-
-    msp = doc.modelspace()
-    contours = []
-
-    for entity in msp:
-        e_type = entity.dxftype()
-        if e_type == 'LINE':
-            s, e = entity.dxf.start, entity.dxf.end
-            line_style = getattr(entity.dxf, 'linetype', '').upper()
-            layer_name = getattr(entity.dxf, 'layer', '').upper()
-            if 'CENTER' in line_style or 'DASHDOT' in line_style or 'DIM' in layer_name:
-                continue
-            contours.append([
-                {"x": round(s.x, 2), "y": round(s.y, 2)},
-                {"x": round(e.x, 2), "y": round(e.y, 2)}
-            ])
-        elif e_type in ('CIRCLE', 'ARC'):
-            cx, cy = entity.dxf.center.x, entity.dxf.center.y
-            r = entity.dxf.radius
-            start_angle = 0.0 if e_type == 'CIRCLE' else math.radians(entity.dxf.start_angle)
-            end_angle = (2 * math.pi) if e_type == 'CIRCLE' else math.radians(entity.dxf.end_angle)
-            if end_angle <= start_angle:
-                end_angle += 2 * math.pi
-
-            steps = max(16, int(math.degrees(end_angle - start_angle) / 5))
-            pts = []
-            for i in range(steps + 1):
-                a = start_angle + i * ((end_angle - start_angle) / steps)
-                pts.append({"x": round(cx + r * math.cos(a), 2), "y": round(cy + r * math.sin(a), 2)})
-            contours.append(pts)
-
-    return contours, {"DXF_ENTITIES": len(contours)}
-
-@app.post("/process-dxf")
-async def process_file(file: UploadFile = File(...)):
-    filename = file.filename.lower()
-    if not filename.endswith(('.dxf', '.png', '.jpg', '.jpeg')):
-        raise HTTPException(status_code=400, detail="Формат файла не поддерживается.")
-
-    contents = await file.read()
-
-    try:
-        if filename.endswith(('.png', '.jpg', '.jpeg')):
-            profile = analyze_drawing_with_gemini(contents)
-            return {
-                "filename": file.filename,
-                "status": "success",
-                "contours_count": 1,
-                "entity_breakdown": {"GEMINI_DYNAMIC_ENGINE": True, "POINTS_COUNT": len(profile)},
-                "contours": [profile]
-            }
+    for step in steps:
+        r = step["diameter"] / 2.0
+        l = step["length"]
+        cyl = cq.Workplane("XY").workplane(offset=current_z).circle(r).extrude(l)
+        if result is None:
+            result = cyl
         else:
-            contours, breakdown = process_dxf_file(contents)
-            return {
-                "filename": file.filename,
-                "status": "success",
-                "contours_count": len(contours),
-                "entity_breakdown": breakdown,
-                "contours": contours
-            }
+            result = result.union(cyl)
+        current_z += l
+
+    # 2. Выполнение центрального отверстия
+    bore = spec.get("inner_bore")
+    if bore and bore.get("diameter", 0) > 0:
+        bore_r = bore["diameter"] / 2.0
+        result = result.faces("<Z").workplane().circle(bore_r).cutThruAll()
+
+    # 3. Сохранение в STEP и STL
+    step_path = f"exports/{filename_base}.step"
+    stl_path = f"exports/{filename_base}.stl"
+
+    cq.exporters.export(result, step_path)
+    cq.exporters.export(result, stl_path)
+
+    return step_path, stl_path
+
+@app.post("/api/analyze")
+async def analyze_file(file: UploadFile = File(...)):
+    contents = await file.read()
+    filename_base = os.path.splitext(file.filename)[0]
+
+    try:
+        # Шаг 1: Распознавание ИИ
+        spec = parse_drawing_with_gemini(contents)
+        
+        # Шаг 2: Параметрическая генерация 3D STEP / STL
+        step_file, stl_file = build_cad_model(spec, filename_base)
+
+        return {
+            "status": "success",
+            "spec": spec,
+            "stl_url": f"/download/{filename_base}.stl",
+            "step_url": f"/download/{filename_base}.step"
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    path = f"exports/{filename}"
+    if os.path.exists(path):
+        return FileResponse(path)
+    raise HTTPException(status_code=404, detail="Файл не найден.")
