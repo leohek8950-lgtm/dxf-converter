@@ -13,7 +13,6 @@ import cadquery as cq
 
 app = FastAPI(title="Precision AI CAD Engine")
 
-# Включаем CORS для корректной загрузки 3D файлов браузером
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,200 +24,15 @@ app.add_middleware(
 EXPORTS_DIR = "exports"
 os.makedirs(EXPORTS_DIR, exist_ok=True)
 
-# Встроенный HTML-интерфейс с зафиксированной трехмерной визуализацией Three.js
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Precision AI CAD</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        body { background-color: #0f172a; color: #f8fafc; display: flex; height: 100vh; overflow: hidden; }
-        #sidebar { width: 360px; background-color: #1e293b; padding: 20px; display: flex; flex-direction: column; gap: 15px; border-right: 1px solid #334155; z-index: 10; }
-        h2 { color: #38bdf8; font-size: 1.2rem; display: flex; align-items: center; gap: 8px; }
-        .upload-box { border: 2px dashed #475569; border-radius: 8px; padding: 20px; text-align: center; cursor: pointer; transition: 0.3s; background: #0f172a; }
-        .upload-box:hover { border-color: #38bdf8; background: #1e293b; }
-        input[type="file"] { display: none; }
-        button { background-color: #0284c7; color: white; border: none; padding: 12px; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.2s; }
-        button:hover { background-color: #0369a1; }
-        button:disabled { background-color: #475569; cursor: not-allowed; }
-        .download-btn { background-color: #16a34a; }
-        .download-btn:hover { background-color: #15803d; }
-        #json-output { background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 10px; font-family: monospace; font-size: 0.75rem; color: #38bdf8; overflow-y: auto; flex-grow: 1; white-space: pre-wrap; }
-        #viewport { flex-grow: 1; position: relative; background: #020617; }
-        #status-msg { position: absolute; top: 20px; left: 20px; padding: 10px 18px; border-radius: 6px; font-weight: 500; font-size: 0.9rem; z-index: 20; display: none; }
-        .status-success { background: #166534; color: #4ade80; border: 1px solid #22c55e; }
-        .status-error { background: #991b1b; color: #fca5a5; border: 1px solid #ef4444; }
-        .status-loading { background: #1e3a8a; color: #93c5fd; border: 1px solid #3b82f6; }
-    </style>
-</head>
-<body>
-    <div id="sidebar">
-        <h2>⚙️ Precision AI CAD</h2>
-        <div class="upload-box" onclick="document.getElementById('fileInput').click()">
-            <span id="file-label">📄 Выбрать чертеж (.jpg, .png)</span>
-            <input type="file" id="fileInput" accept="image/*" onchange="handleFileSelect(event)">
-        </div>
-        <button id="processBtn" onclick="uploadDrawing()" disabled>⚡ Сгенерировать STEP модель</button>
-        <button id="downloadBtn" class="download-btn" style="display:none;" onclick="downloadStep()">💾 Скачать файл .STEP</button>
-        <div style="font-size:0.8rem; color:#94a3b8; font-weight:bold;">РАСПОЗНАННАЯ ГЕОМЕТРИЯ (JSON):</div>
-        <div id="json-output">// Ожидание файла...</div>
-    </div>
-    <div id="viewport">
-        <div id="status-msg"></div>
-    </div>
-
-    <script>
-        let selectedFile = null;
-        let stepDownloadUrl = "";
-        let scene, camera, renderer, controls, currentMesh;
-
-        function init3D() {
-            const container = document.getElementById('viewport');
-            scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x020617);
-
-            camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
-            camera.position.set(100, 100, 100);
-
-            renderer = new THREE.WebGLRenderer({ antialias: true });
-            renderer.setSize(container.clientWidth, container.clientHeight);
-            renderer.setPixelRatio(window.devicePixelRatio);
-            container.appendChild(renderer.domElement);
-
-            controls = new THREE.OrbitControls(camera, renderer.domElement);
-            controls.enableDamping = true;
-
-            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
-            scene.add(ambientLight);
-
-            const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
-            dirLight1.position.set(1, 1, 1).normalize();
-            scene.add(dirLight1);
-
-            const dirLight2 = new THREE.DirectionalLight(0x38bdf8, 0.5);
-            dirLight2.position.set(-1, -1, -1).normalize();
-            scene.add(dirLight2);
-
-            const gridHelper = new THREE.GridHelper(200, 20, 0x334155, 0x1e293b);
-            scene.add(gridHelper);
-
-            window.addEventListener('resize', onWindowResize);
-            animate();
-        }
-
-        function animate() {
-            requestAnimationFrame(animate);
-            controls.update();
-            renderer.render(scene, camera);
-        }
-
-        function onWindowResize() {
-            const container = document.getElementById('viewport');
-            camera.aspect = container.clientWidth / container.clientHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(container.clientWidth, container.clientHeight);
-        }
-
-        function showStatus(text, type) {
-            const msg = document.getElementById('status-msg');
-            msg.className = 'status-' + type;
-            msg.innerText = text;
-            msg.style.display = 'block';
-        }
-
-        function handleFileSelect(e) {
-            if (e.target.files.length > 0) {
-                selectedFile = e.target.files[0];
-                document.getElementById('file-label').innerText = 'Выбран файл:\n' + selectedFile.name;
-                document.getElementById('processBtn').disabled = false;
-            }
-        }
-
-        async function uploadDrawing() {
-            if (!selectedFile) return;
-
-            showStatus('⏳ Выполняется визуальный и размерный анализ чертежа...', 'loading');
-            document.getElementById('processBtn').disabled = true;
-            document.getElementById('downloadBtn').style.display = 'none';
-            document.getElementById('json-output').innerText = '// Обработка детали...';
-
-            const formData = new FormData();
-            formData.append('file', selectedFile);
-
-            try {
-                const res = await fetch('/api/analyze', { method: 'POST', body: formData });
-                const data = await res.json();
-
-                if (data.status === 'success') {
-                    showStatus('✅ 3D Модель успешно построена!', 'success');
-                    document.getElementById('json-output').innerText = JSON.stringify(data.spec, null, 2);
-                    stepDownloadUrl = data.step_url;
-                    document.getElementById('downloadBtn').style.display = 'block';
-                    loadSTL(data.stl_url);
-                } else {
-                    showStatus('❌ Ошибка: ' + (data.error || 'Неизвестный сбой'), 'error');
-                    document.getElementById('json-output').innerText = '// Ошибка:\n' + JSON.stringify(data, null, 2);
-                }
-            } catch (err) {
-                showStatus('❌ Ошибка соединения с сервером', 'error');
-                document.getElementById('json-output').innerText = '// Ошибка сети:\n' + err.message;
-            } finally {
-                document.getElementById('processBtn').disabled = false;
-            }
-        }
-
-        function loadSTL(url) {
-            const loader = new THREE.STLLoader();
-            loader.load(url, function (geometry) {
-                if (currentMesh) scene.remove(currentMesh);
-
-                geometry.computeVertexNormals();
-                const material = new THREE.MeshStandardMaterial({
-                    color: 0x94a3b8,
-                    roughness: 0.3,
-                    metalness: 0.6
-                });
-                currentMesh = new THREE.Mesh(geometry, material);
-
-                geometry.center();
-                geometry.computeBoundingBox();
-                const box = geometry.boundingBox;
-                const maxDim = Math.max(box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z);
-                
-                camera.position.set(maxDim * 1.5, maxDim * 1.5, maxDim * 1.5);
-                controls.target.set(0, 0, 0);
-
-                scene.add(currentMesh);
-            }, undefined, function (error) {
-                showStatus('❌ Ошибка визуализации STL модели', 'error');
-                console.error(error);
-            });
-        }
-
-        function downloadStep() {
-            if (stepDownloadUrl) {
-                window.location.href = stepDownloadUrl;
-            }
-        }
-
-        window.onload = init3D;
-    </script>
-</body>
-</html>
-"""
-
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
-    return HTML_TEMPLATE
+    try:
+        with open("index.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "<h1>Ошибка: файл index.html не найден в корне проекта.</h1>"
 
 def compress_image_bytes(img_bytes: bytes, max_dim=800) -> bytes:
-    """Уменьшение картинки для отклика Gemini API в пределах 3-5 секунд"""
     try:
         img = Image.open(io.BytesIO(img_bytes))
         img.thumbnail((max_dim, max_dim))
