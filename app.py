@@ -95,9 +95,11 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         }
     }
 
+    # Актуальные имена моделей
     models_to_try = [
+        ("v1beta", "gemini-2.5-flash"),
         ("v1beta", "gemini-1.5-flash"),
-        ("v1beta", "gemini-2.0-flash")
+        ("v1", "gemini-1.5-flash")
     ]
 
     last_err = None
@@ -105,7 +107,7 @@ def parse_drawing_with_gemini(img_bytes: bytes):
         url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model_name}:generateContent"
         params = {"key": api_key}
         try:
-            res = requests.post(url, params=params, json=payload, timeout=20)
+            res = requests.post(url, params=params, json=payload, timeout=25)
             if res.status_code == 200:
                 res_data = res.json()
                 text_content = res_data['candidates'][0]['content']['parts'][0]['text']
